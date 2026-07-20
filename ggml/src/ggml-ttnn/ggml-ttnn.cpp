@@ -12,6 +12,7 @@
 #include "ggml-backend.h"
 #include "ggml-impl.h"
 
+#include <tt-metalium/bfloat16.hpp>
 #include <tt-metalium/distributed.hpp>
 #include <tt-metalium/host_api.hpp>
 
@@ -68,6 +69,45 @@ struct ggml_backend_ttnn_buffer_context {
     std::unordered_map<const void *, std::shared_ptr<ttd::MeshBuffer>> tensor_buffers;
 };
 
+// I2_S (Option A): dequantize packed ternary weights to bf16 once, at
+// upload time, so the device side can use stock TT-NN matmul before any
+// custom packed-ternary kernel exists (Option B).
+//
+// Mirrors the *strided* bit layout verified against the real AVX2 inference
+// dot product (ggml_vec_dot_i2_i8_s_1x1, same quants.c): byte
+// packed[done/4+gp] holds four 2-bit codes for elements at done+gp,
+// done+32+gp, done+64+gp, done+96+gp within each 128-element super-block -
+// NOT quantize_i2_s's own consecutive-i/4 packing, which disagrees with the
+// dot product it's supposedly paired with. See PORTING_PLAN.md sec 10.
+static void ggml_backend_ttnn_dequantize_i2_s(const uint8_t * packed, int64_t n, std::vector<bfloat16> & out) {
+    static const float map2bit[4] = { -1.0f, 0.0f, 1.0f, 0.0f };
+    float scale;
+    memcpy(&scale, packed + n / 4, sizeof(float));
+    out.resize(n);
+    for (int64_t done = 0; done < n; done += 128) {
+        for (int gp = 0; gp < 32 && done + gp < n; gp++) {
+            uint8_t byte = packed[done / 4 + gp];
+            for (int lane = 0; lane < 4; lane++) {
+                int64_t idx = done + lane * 32 + gp;
+                if (idx >= n) {
+                    continue;
+                }
+                uint8_t code = (byte >> (6 - 2 * lane)) & 0x03;
+                out[idx] = bfloat16(scale * map2bit[code]);
+            }
+        }
+    }
+}
+
+// I2_S tensors are stored on-device as dequantized bf16 (Option A); every
+// other type keeps its normal ggml byte size.
+static size_t ggml_backend_ttnn_device_alloc_size(const struct ggml_tensor * tensor) {
+    if (tensor->type == GGML_TYPE_I2_S) {
+        return ggml_nelements(tensor) * sizeof(bfloat16);
+    }
+    return ggml_nbytes(tensor);
+}
+
 static const char * ggml_backend_ttnn_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
     return "TT_Metalium";
@@ -91,7 +131,7 @@ static enum ggml_status ggml_backend_ttnn_buffer_init_tensor(ggml_backend_buffer
 
     ggml_backend_ttnn_buffer_context * ctx = (ggml_backend_ttnn_buffer_context *) buffer->context;
     auto mesh_device = ggml_backend_ttnn_get_mesh_device();
-    size_t nbytes = ggml_nbytes(tensor);
+    size_t nbytes = ggml_backend_ttnn_device_alloc_size(tensor);
 
     // One page spanning the whole buffer: every access to it is whole-buffer
     // (offset 0, size == nbytes), so this is always the safe end-anchored
@@ -146,6 +186,20 @@ static void ggml_backend_ttnn_buffer_memset_tensor(ggml_backend_buffer_t buffer,
 
 static void ggml_backend_ttnn_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     auto mesh_buffer = ggml_backend_ttnn_lookup(buffer, tensor);
+
+    if (tensor->type == GGML_TYPE_I2_S) {
+        // Always uploaded whole: `data`/`size` here are the packed ternary
+        // bytes as stored in the gguf file (ggml_nbytes, not the device's
+        // dequantized bf16 size) - a partial update of packed+scaled data
+        // isn't a meaningful operation, so this only supports the one-shot
+        // whole-tensor upload weight loading actually does.
+        GGML_ASSERT(offset == 0 && size == ggml_nbytes(tensor));
+        std::vector<bfloat16> dequantized;
+        ggml_backend_ttnn_dequantize_i2_s((const uint8_t *) data, ggml_nelements(tensor), dequantized);
+        ggml_backend_ttnn_write_whole(mesh_buffer, dequantized.data());
+        return;
+    }
+
     size_t total = mesh_buffer->size();
     if (offset == 0 && size == total) {
         ggml_backend_ttnn_write_whole(mesh_buffer, data);
@@ -178,6 +232,11 @@ static void ggml_backend_ttnn_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
         std::vector<uint8_t> fill(kv.second->size(), value);
         ggml_backend_ttnn_write_whole(kv.second, fill.data());
     }
+}
+
+static size_t ggml_backend_ttnn_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
+    GGML_UNUSED(buft);
+    return ggml_backend_ttnn_device_alloc_size(tensor);
 }
 
 static const struct ggml_backend_buffer_i ggml_backend_ttnn_buffer_i = {
@@ -223,7 +282,7 @@ static const struct ggml_backend_buffer_type_i ggml_backend_ttnn_buffer_type_i =
     /* .alloc_buffer   = */ ggml_backend_ttnn_buffer_type_alloc_buffer,
     /* .get_alignment  = */ ggml_backend_ttnn_buffer_type_get_alignment,
     /* .get_max_size   = */ NULL,
-    /* .get_alloc_size = */ NULL,
+    /* .get_alloc_size = */ ggml_backend_ttnn_buffer_type_get_alloc_size,
     /* .is_host        = */ ggml_backend_ttnn_buffer_type_is_host,
 };
 
