@@ -1,10 +1,10 @@
 // Tenstorrent Blackhole backend for ggml, built on TT-Metalium / TT-NN.
 //
 // This backend opens a real TT-Metalium device (silicon or ttsim, selected
-// the standard tt-metal way via TT_METAL_SIMULATOR - never branched on here)
-// but does not offload any ops yet: supports_op() always returns false, so
-// the graph scheduler never assigns this backend any op. DRAM-backed buffers
-// and op offload land in follow-up increments.
+// the standard tt-metal way via TT_METAL_SIMULATOR - never branched on here).
+// Op offload is currently limited to GGML_OP_MUL_MAT with an I2_S weight
+// (Option A: dequantized to bf16 on upload, stock TT-NN ttnn::matmul) -
+// everything else still returns false from supports_op().
 
 #include "ggml-ttnn.h"
 
@@ -15,6 +15,11 @@
 #include <tt-metalium/bfloat16.hpp>
 #include <tt-metalium/distributed.hpp>
 #include <tt-metalium/host_api.hpp>
+
+#include <ttnn/operations/matmul/matmul.hpp>
+#include <ttnn/tensor/tensor.hpp>
+#include <ttnn/tensor/shape/shape.hpp>
+#include <ttnn/types.hpp>
 
 #include <cstdlib>
 #include <cstring>
@@ -35,8 +40,19 @@ namespace ttd = tt::tt_metal::distributed;
 // -----------------------------------------------------------------------
 
 static std::shared_ptr<ttd::MeshDevice> ggml_backend_ttnn_get_mesh_device() {
-    static std::shared_ptr<ttd::MeshDevice> mesh_device = ttd::MeshDevice::create_unit_mesh(0);
-    return mesh_device;
+    // Intentionally never destroyed. Once any real op has populated
+    // tt-metal's program cache, destroying the MeshDevice crashes inside
+    // GraphTracker's circular-buffer deallocation callback - reproduced with
+    // a plain ttnn::matmul call, no ggml involved, and *still* crashes even
+    // when close() is called first via an atexit hook ordered ahead of the
+    // static's own destructor (close() apparently doesn't fully neutralize
+    // the program cache before later teardown touches it). Since the
+    // process is exiting either way, leaking this is safe and side-steps
+    // the whole static-destruction-order question - the same pragmatic
+    // choice other libraries with similar teardown fragility (e.g. CUDA
+    // driver contexts) commonly make.
+    static std::shared_ptr<ttd::MeshDevice> * mesh_device = new std::shared_ptr<ttd::MeshDevice>(ttd::MeshDevice::create_unit_mesh(0));
+    return *mesh_device;
 }
 
 // -----------------------------------------------------------------------
@@ -311,12 +327,80 @@ static void ggml_backend_ttnn_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// GGML_OP_MUL_MAT, I2_S weight x F32 activation -> F32 (Option A).
+//
+// ggml's mul_mat(src0, src1) convention: src0 (ne=[K,N]) is a row-major
+// [N,K] weight matrix (N output features, K input features - ne[0] is the
+// contiguous/fastest dim); src1 (ne=[K,M]) is a row-major [M,K] activation
+// batch. dst (ne=[N,M]) is the row-major [M,N] result of `act @ weight^T`,
+// exactly nn.Linear's convention. That maps directly onto
+// ttnn::matmul(act, weight, transpose_a=false, transpose_b=true).
+//
+// Both operands are staged through host memory into fresh ttnn::Tensor
+// objects rather than reusing the MeshBuffers this backend already manages
+// (see the buffer-type comment above) - this backend doesn't yet store
+// ttnn::Tensor natively, so this round-trips already-on-device weight data
+// through the host on every call. Correct, not yet fast; avoiding this is
+// follow-up work once the buffer type is redesigned around ttnn::Tensor.
+static void ggml_backend_ttnn_compute_mul_mat(struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_I2_S);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const uint32_t K = (uint32_t) src0->ne[0];
+    const uint32_t N = (uint32_t) src0->ne[1];
+    const uint32_t M = (uint32_t) src1->ne[1];
+    GGML_ASSERT((uint32_t) src1->ne[0] == K);
+    GGML_ASSERT((uint32_t) dst->ne[0] == N && (uint32_t) dst->ne[1] == M);
+
+    auto weight_buf = ggml_backend_ttnn_lookup(src0->buffer, src0);
+    std::vector<bfloat16> weight_host(N * K);
+    ggml_backend_ttnn_read_whole(weight_buf, weight_host.data());
+
+    auto act_buf = ggml_backend_ttnn_lookup(src1->buffer, src1);
+    std::vector<float> act_host(M * K);
+    ggml_backend_ttnn_read_whole(act_buf, act_host.data());
+
+    auto mesh_device = ggml_backend_ttnn_get_mesh_device();
+    const tt::tt_metal::MemoryConfig mem_cfg{tt::tt_metal::TensorMemoryLayout::INTERLEAVED, tt::tt_metal::BufferType::DRAM};
+    const tt::tt_metal::TensorLayout weight_layout(tt::tt_metal::DataType::BFLOAT16, tt::tt_metal::PageConfig(tt::tt_metal::Layout::TILE), mem_cfg);
+    const tt::tt_metal::TensorLayout act_layout(tt::tt_metal::DataType::FLOAT32, tt::tt_metal::PageConfig(tt::tt_metal::Layout::TILE), mem_cfg);
+
+    ttnn::Tensor weight_t = ttnn::Tensor::from_vector(weight_host, ttnn::TensorSpec(ttnn::Shape({N, K}), weight_layout))
+                                 .to_device(mesh_device.get(), mem_cfg);
+    ttnn::Tensor act_t = ttnn::Tensor::from_vector(act_host, ttnn::TensorSpec(ttnn::Shape({M, K}), act_layout))
+                              .to_device(mesh_device.get(), mem_cfg);
+
+    ttnn::Tensor out_t = ttnn::matmul(act_t, weight_t, /*transpose_a=*/false, /*transpose_b=*/true, mem_cfg);
+
+    std::vector<float> out_host = out_t.to_vector<float>();
+
+    auto dst_buf = ggml_backend_ttnn_lookup(dst->buffer, dst);
+    ggml_backend_ttnn_write_whole(dst_buf, out_host.data());
+}
+
 static enum ggml_status ggml_backend_ttnn_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_UNUSED(backend);
-    GGML_UNUSED(cgraph);
-    // supports_op() always returns false today, so the scheduler never
-    // assigns this backend any op - this should be unreachable.
-    GGML_ABORT("ggml-ttnn: graph_compute called with no ops offloaded yet");
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        struct ggml_tensor * node = cgraph->nodes[i];
+        switch (node->op) {
+            case GGML_OP_MUL_MAT:
+                ggml_backend_ttnn_compute_mul_mat(node);
+                break;
+            case GGML_OP_NONE:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_VIEW:
+            case GGML_OP_TRANSPOSE:
+            case GGML_OP_PERMUTE:
+                break;
+            default:
+                GGML_ABORT("ggml-ttnn: graph_compute got op '%s', which supports_op() should not have allowed", ggml_op_name(node->op));
+        }
+    }
+    return GGML_STATUS_SUCCESS;
 }
 
 static const struct ggml_backend_i ggml_backend_ttnn_i = {
@@ -406,9 +490,12 @@ static ggml_backend_buffer_type_t ggml_backend_ttnn_device_get_buffer_type(ggml_
 
 static bool ggml_backend_ttnn_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(op);
-    // No ops offloaded yet - see file header.
-    return false;
+    if (op->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+    const struct ggml_tensor * src0 = op->src[0];
+    const struct ggml_tensor * src1 = op->src[1];
+    return src0->type == GGML_TYPE_I2_S && src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
 }
 
 static bool ggml_backend_ttnn_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
