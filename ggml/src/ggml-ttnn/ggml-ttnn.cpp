@@ -1,12 +1,10 @@
 // Tenstorrent Blackhole backend for ggml, built on TT-Metalium / TT-NN.
 //
-// This is the registration skeleton only: it wires a single accelerator
-// device into the ggml-backend registry so the CMake/link plumbing
-// (-DGGML_TTNN=ON) and registry integration can be validated end to end.
-// supports_op() always returns false, so the graph scheduler never assigns
-// any op to this backend yet - it is a no-op addition to the default build.
-// Real TT-Metalium device init, DRAM-backed buffers, and op offload land in
-// follow-up increments.
+// This backend opens a real TT-Metalium device (silicon or ttsim, selected
+// the standard tt-metal way via TT_METAL_SIMULATOR - never branched on here)
+// but does not offload any ops yet: supports_op() always returns false, so
+// the graph scheduler never assigns this backend any op. DRAM-backed buffers
+// and op offload land in follow-up increments.
 
 #include "ggml-ttnn.h"
 
@@ -14,8 +12,12 @@
 #include "ggml-backend.h"
 #include "ggml-impl.h"
 
+#include <tt-metalium/distributed.hpp>
+#include <tt-metalium/host_api.hpp>
+
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 
 // -----------------------------------------------------------------------
 // Buffer type / buffer
@@ -110,12 +112,21 @@ static ggml_backend_buffer_type_t ggml_backend_ttnn_buffer_type(ggml_backend_dev
 // Backend (stream)
 // -----------------------------------------------------------------------
 
+struct ggml_backend_ttnn_context {
+    std::shared_ptr<tt::tt_metal::distributed::MeshDevice> mesh_device;
+};
+
 static const char * ggml_backend_ttnn_get_name(ggml_backend_t backend) {
     GGML_UNUSED(backend);
     return "TT_Metalium";
 }
 
 static void ggml_backend_ttnn_free(ggml_backend_t backend) {
+    ggml_backend_ttnn_context * ctx = (ggml_backend_ttnn_context *) backend->context;
+    if (ctx->mesh_device) {
+        ctx->mesh_device->close();
+    }
+    delete ctx;
     delete backend;
 }
 
@@ -194,11 +205,17 @@ static void ggml_backend_ttnn_device_get_props(ggml_backend_dev_t dev, struct gg
 
 static ggml_backend_t ggml_backend_ttnn_device_init(ggml_backend_dev_t dev, const char * params) {
     GGML_UNUSED(params);
+
+    ggml_backend_ttnn_context * ctx = new ggml_backend_ttnn_context;
+    // Opens device 0 the standard tt-metal way: silicon vs. ttsim is chosen
+    // by the driver via TT_METAL_SIMULATOR, never branched on here.
+    ctx->mesh_device = tt::tt_metal::distributed::MeshDevice::create_unit_mesh(0);
+
     ggml_backend_t backend = new ggml_backend {
         /* .guid     = */ ggml_backend_ttnn_guid(),
         /* .iface    = */ ggml_backend_ttnn_i,
         /* .device   = */ dev,
-        /* .context  = */ NULL,
+        /* .context  = */ ctx,
     };
     return backend;
 }
