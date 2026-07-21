@@ -140,10 +140,21 @@ static void * ggml_backend_ttnn_buffer_get_base(ggml_backend_buffer_t buffer) {
 }
 
 static enum ggml_status ggml_backend_ttnn_buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) {
-    // A view shares its parent's device buffer at (usually non-zero,
-    // non-whole-buffer) view_offs, which is exactly the unsafe access
-    // pattern above - not yet supported.
-    GGML_ASSERT(tensor->view_src == NULL && "ggml-ttnn: tensor views are not yet supported by the DRAM buffer type");
+    if (tensor->view_src != NULL) {
+        // ggml_gallocr wraps op outputs in a same-buffer, offset-0 "view of
+        // itself" for its own bookkeeping (seen with ggml_backend_sched:
+        // mul_mat's dst arrives here as a view of a GGML_OP_MUL_MAT source
+        // at view_offs 0) - since offset 0 means tensor->data ==
+        // view_src->data, the existing tensor_buffers entry for view_src
+        // (keyed by that same pointer, registered when view_src itself was
+        // init_tensor'd) already covers this tensor; nothing to do. Any
+        // other view - non-zero offset, i.e. a genuine sub-region of a
+        // buffer - would need interior device-buffer access, which isn't
+        // supported (see the buffer-type comment above).
+        GGML_ASSERT(tensor->view_offs == 0 && tensor->data == tensor->view_src->data &&
+                     "ggml-ttnn: only whole-tensor views are supported by the DRAM buffer type");
+        return GGML_STATUS_SUCCESS;
+    }
 
     ggml_backend_ttnn_buffer_context * ctx = (ggml_backend_ttnn_buffer_context *) buffer->context;
     auto mesh_device = ggml_backend_ttnn_get_mesh_device();
@@ -490,6 +501,16 @@ static ggml_backend_buffer_type_t ggml_backend_ttnn_device_get_buffer_type(ggml_
 
 static bool ggml_backend_ttnn_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
+    // GGML_OP_NONE is a real leaf (e.g. a weight tensor already sitting in
+    // this backend's buffer, no view) - the scheduler queries supports_op()
+    // for these too (ggml_backend_sched_backend_from_buffer), and they need
+    // no compute. VIEW/RESHAPE/TRANSPOSE/PERMUTE are NOT included here even
+    // though graph_compute() tolerates them: the buffer type's init_tensor
+    // hard-rejects tensor->view_src != NULL (see comment there), so the
+    // scheduler must never be told this device can take a real view op.
+    if (op->op == GGML_OP_NONE) {
+        return true;
+    }
     if (op->op != GGML_OP_MUL_MAT) {
         return false;
     }
