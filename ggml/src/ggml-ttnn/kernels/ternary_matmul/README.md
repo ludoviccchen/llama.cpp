@@ -3,7 +3,7 @@
 Custom TT-Metalium reader/compute/writer kernel triad for I2_S ternary
 matmul, consuming packed 2-bit weights directly rather than dequantizing
 them to bf16 on upload (Option A, `ggml-ttnn.cpp`'s current `graph_compute`
-path). See `PORTING_PLAN.md` sec 13 for the full design writeup and
+path). See `PORTING_PLAN.md` sec 13/14 for the full design writeup and
 validation results.
 
 - `dataflow/reader_ternary_mm.cpp` - unpacks packed I2_S weight bytes
@@ -18,16 +18,20 @@ validation results.
   conditional negate/pass-through/zero of the activation - already an
   add/sub-style accumulation, just executed on the existing
   multiply-accumulate datapath.
-- `dataflow/writer_ternary_mm.cpp` - unmodified stock tile writer. Writes
-  the *unscaled* dot product; the caller applies the per-tensor weight
-  scale afterward (not baked in per-element here).
+- `dataflow/writer_ternary_mm.cpp` - stock tile writer, adapted for our
+  `[N, M]` (not the stock example's `[M, N]`) output convention: DRAM page
+  index is `n*Mt + m` (N-tile major), not `m*Nt + n`. Writes the *unscaled*
+  dot product; the caller applies the per-tensor weight scale afterward
+  (not baked in per-element here).
 
 ## Current scope
 
-Single N-tile weight (N=32): the packed I2_S format stores one scale for
-the whole tensor, not per N-tile, so the packed blob for one N-tile is
-read as a single DRAM page and multi-N-tile support isn't implemented yet
-(needs the scale handled per-tensor across tiles, not per-page).
+Handles arbitrary Mt/Kt/Nt (multiple M-tiles, N-tiles, and K
+super-blocks/row - see PORTING_PLAN.md sec 14), but the whole packed weight
+blob is read once into a scratch L1 CB and kept resident for the entire
+kernel - correct, but doesn't scale to real-model-sized weights (the blob
+has to fit in L1 alongside everything else). Chunked/streamed weight reads
+are follow-up work before this is usable on realistic dimensions.
 
 ## Status
 
