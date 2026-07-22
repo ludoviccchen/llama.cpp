@@ -35,7 +35,10 @@ are follow-up work before this is usable on realistic dimensions.
 
 ## Status
 
-Validated under ttsim via a standalone TT-Metalium `Program`/`Kernel`
-dispatch (bypassing TT-NN, unlike the Option A path) - not yet wired into
-`ggml-ttnn.cpp`'s `supports_op`/`graph_compute`, which still uses Option A.
-Wiring these in as a selectable/preferred path is follow-up work.
+Wired into `ggml-ttnn.cpp`'s `supports_op`/`graph_compute`, replacing
+Option A entirely for `GGML_OP_MUL_MAT` (see PORTING_PLAN.md sec 15) -
+`compute_mul_mat` dispatches this exact kernel triad via a real TT-Metalium
+`Program`/`Kernel`, reusing the weight tensor's own resident `MeshBuffer`
+directly (no re-upload). TT-NN is no longer linked by this backend at all.
+Re-verified under ttsim through the real `ggml_backend_sched`/
+`graph_compute` path, not just a hand-rolled dispatch.

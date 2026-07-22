@@ -1,9 +1,11 @@
-// Tenstorrent Blackhole backend for ggml, built on TT-Metalium / TT-NN.
+// Tenstorrent Blackhole backend for ggml, built on TT-Metalium.
 //
 // This backend opens a real TT-Metalium device (silicon or ttsim, selected
 // the standard tt-metal way via TT_METAL_SIMULATOR - never branched on here).
 // Op offload is currently limited to GGML_OP_MUL_MAT with an I2_S weight
-// (Option A: dequantized to bf16 on upload, stock TT-NN ttnn::matmul) -
+// (Option B: packed 2-bit ternary weights consumed directly by custom
+// reader/compute/writer kernels in kernels/ternary_matmul/, unpacked
+// on-device - see that directory's README and PORTING_PLAN.md sec 13/14) -
 // everything else still returns false from supports_op().
 
 #include "ggml-ttnn.h"
@@ -13,13 +15,12 @@
 #include "ggml-impl.h"
 
 #include <tt-metalium/bfloat16.hpp>
+#include <tt-metalium/constants.hpp>
+#include <tt-metalium/core_coord.hpp>
 #include <tt-metalium/distributed.hpp>
 #include <tt-metalium/host_api.hpp>
-
-#include <ttnn/operations/matmul/matmul.hpp>
-#include <ttnn/tensor/tensor.hpp>
-#include <ttnn/tensor/shape/shape.hpp>
-#include <ttnn/types.hpp>
+#include <tt-metalium/tensor_accessor_args.hpp>
+#include <tt-metalium/tilize_utils.hpp>
 
 #include <cstdlib>
 #include <cstring>
@@ -85,45 +86,6 @@ struct ggml_backend_ttnn_buffer_context {
     std::unordered_map<const void *, std::shared_ptr<ttd::MeshBuffer>> tensor_buffers;
 };
 
-// I2_S (Option A): dequantize packed ternary weights to bf16 once, at
-// upload time, so the device side can use stock TT-NN matmul before any
-// custom packed-ternary kernel exists (Option B).
-//
-// Mirrors the *strided* bit layout verified against the real AVX2 inference
-// dot product (ggml_vec_dot_i2_i8_s_1x1, same quants.c): byte
-// packed[done/4+gp] holds four 2-bit codes for elements at done+gp,
-// done+32+gp, done+64+gp, done+96+gp within each 128-element super-block -
-// NOT quantize_i2_s's own consecutive-i/4 packing, which disagrees with the
-// dot product it's supposedly paired with. See PORTING_PLAN.md sec 10.
-static void ggml_backend_ttnn_dequantize_i2_s(const uint8_t * packed, int64_t n, std::vector<bfloat16> & out) {
-    static const float map2bit[4] = { -1.0f, 0.0f, 1.0f, 0.0f };
-    float scale;
-    memcpy(&scale, packed + n / 4, sizeof(float));
-    out.resize(n);
-    for (int64_t done = 0; done < n; done += 128) {
-        for (int gp = 0; gp < 32 && done + gp < n; gp++) {
-            uint8_t byte = packed[done / 4 + gp];
-            for (int lane = 0; lane < 4; lane++) {
-                int64_t idx = done + lane * 32 + gp;
-                if (idx >= n) {
-                    continue;
-                }
-                uint8_t code = (byte >> (6 - 2 * lane)) & 0x03;
-                out[idx] = bfloat16(scale * map2bit[code]);
-            }
-        }
-    }
-}
-
-// I2_S tensors are stored on-device as dequantized bf16 (Option A); every
-// other type keeps its normal ggml byte size.
-static size_t ggml_backend_ttnn_device_alloc_size(const struct ggml_tensor * tensor) {
-    if (tensor->type == GGML_TYPE_I2_S) {
-        return ggml_nelements(tensor) * sizeof(bfloat16);
-    }
-    return ggml_nbytes(tensor);
-}
-
 static const char * ggml_backend_ttnn_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
     return "TT_Metalium";
@@ -158,7 +120,11 @@ static enum ggml_status ggml_backend_ttnn_buffer_init_tensor(ggml_backend_buffer
 
     ggml_backend_ttnn_buffer_context * ctx = (ggml_backend_ttnn_buffer_context *) buffer->context;
     auto mesh_device = ggml_backend_ttnn_get_mesh_device();
-    size_t nbytes = ggml_backend_ttnn_device_alloc_size(tensor);
+    // I2_S tensors are stored packed (device size == host/ggml size, same as
+    // every other type) - Option B's reader kernel unpacks them on-device,
+    // so there is no special-cased device representation to size for here
+    // any more (contrast Option A's now-removed dequant-on-upload).
+    size_t nbytes = ggml_nbytes(tensor);
 
     // One page spanning the whole buffer: every access to it is whole-buffer
     // (offset 0, size == nbytes), so this is always the safe end-anchored
@@ -212,21 +178,12 @@ static void ggml_backend_ttnn_buffer_memset_tensor(ggml_backend_buffer_t buffer,
 }
 
 static void ggml_backend_ttnn_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    // I2_S weights are uploaded and stored packed, byte-for-byte identical
+    // to the gguf file - Option B's reader kernel does the ternary unpack
+    // on-device at compute time, so there's nothing type-specific to do
+    // here; this is the same generic whole-buffer-or-read-modify-write path
+    // every other type uses.
     auto mesh_buffer = ggml_backend_ttnn_lookup(buffer, tensor);
-
-    if (tensor->type == GGML_TYPE_I2_S) {
-        // Always uploaded whole: `data`/`size` here are the packed ternary
-        // bytes as stored in the gguf file (ggml_nbytes, not the device's
-        // dequantized bf16 size) - a partial update of packed+scaled data
-        // isn't a meaningful operation, so this only supports the one-shot
-        // whole-tensor upload weight loading actually does.
-        GGML_ASSERT(offset == 0 && size == ggml_nbytes(tensor));
-        std::vector<bfloat16> dequantized;
-        ggml_backend_ttnn_dequantize_i2_s((const uint8_t *) data, ggml_nelements(tensor), dequantized);
-        ggml_backend_ttnn_write_whole(mesh_buffer, dequantized.data());
-        return;
-    }
-
     size_t total = mesh_buffer->size();
     if (offset == 0 && size == total) {
         ggml_backend_ttnn_write_whole(mesh_buffer, data);
@@ -259,11 +216,6 @@ static void ggml_backend_ttnn_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
         std::vector<uint8_t> fill(kv.second->size(), value);
         ggml_backend_ttnn_write_whole(kv.second, fill.data());
     }
-}
-
-static size_t ggml_backend_ttnn_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
-    GGML_UNUSED(buft);
-    return ggml_backend_ttnn_device_alloc_size(tensor);
 }
 
 static const struct ggml_backend_buffer_i ggml_backend_ttnn_buffer_i = {
@@ -309,7 +261,7 @@ static const struct ggml_backend_buffer_type_i ggml_backend_ttnn_buffer_type_i =
     /* .alloc_buffer   = */ ggml_backend_ttnn_buffer_type_alloc_buffer,
     /* .get_alignment  = */ ggml_backend_ttnn_buffer_type_get_alignment,
     /* .get_max_size   = */ NULL,
-    /* .get_alloc_size = */ ggml_backend_ttnn_buffer_type_get_alloc_size,
+    /* .get_alloc_size = */ NULL,  // defaults to ggml_nbytes, which is exactly right now
     /* .is_host        = */ ggml_backend_ttnn_buffer_type_is_host,
 };
 
@@ -338,21 +290,48 @@ static void ggml_backend_ttnn_free(ggml_backend_t backend) {
     delete backend;
 }
 
-// GGML_OP_MUL_MAT, I2_S weight x F32 activation -> F32 (Option A).
+// True conditions for offloading MUL_MAT at all (shared by supports_op and
+// this function, so the scheduler never routes here a shape the kernels
+// can't handle - see kernels/ternary_matmul/README.md and PORTING_PLAN.md
+// sec 13/14 for why these particular constraints).
+static bool ggml_backend_ttnn_mul_mat_shape_ok(const struct ggml_tensor * src0, const struct ggml_tensor * src1) {
+    const int64_t K = src0->ne[0];
+    const int64_t N = src0->ne[1];
+    const int64_t M = src1->ne[1];
+    constexpr int64_t TILE_DIM = 32;
+    // K a multiple of 128: one I2_S packing super-block never straddles a
+    // row (reader kernel's row-stride assumption). N/M tile-aligned: the FPU
+    // only operates on whole 32x32 tiles.
+    return src1->ne[0] == K && K % 128 == 0 && N % TILE_DIM == 0 && M % TILE_DIM == 0;
+}
+
+// GGML_OP_MUL_MAT, I2_S weight x F32 activation -> F32 (Option B: packed
+// ternary weights consumed directly on-device - see
+// kernels/ternary_matmul/README.md and PORTING_PLAN.md sec 13/14).
 //
 // ggml's mul_mat(src0, src1) convention: src0 (ne=[K,N]) is a row-major
 // [N,K] weight matrix (N output features, K input features - ne[0] is the
 // contiguous/fastest dim); src1 (ne=[K,M]) is a row-major [M,K] activation
-// batch. dst (ne=[N,M]) is the row-major [M,N] result of `act @ weight^T`,
-// exactly nn.Linear's convention. That maps directly onto
-// ttnn::matmul(act, weight, transpose_a=false, transpose_b=true).
+// batch. dst (ne=[N,M]) is the row-major **[M,N]** result of `act @
+// weight^T` (M rows, N contiguous per row - N is ne[0], the fastest dim).
 //
-// Both operands are staged through host memory into fresh ttnn::Tensor
-// objects rather than reusing the MeshBuffers this backend already manages
-// (see the buffer-type comment above) - this backend doesn't yet store
-// ttnn::Tensor natively, so this round-trips already-on-device weight data
-// through the host on every call. Correct, not yet fast; avoiding this is
-// follow-up work once the buffer type is redesigned around ttnn::Tensor.
+// The kernel triad's own tile grid is the opposite way round: the writer
+// lays output tiles out N-tile-major (page index n*Mt+m - see the writer
+// kernel/README), so untilize_nfaces(result_tiled, N, M) reconstructs an
+// N-outer/M-inner matrix - the transpose of what dst's bytes need. That
+// transpose has to happen explicitly below; conflating "the kernel's own
+// tile-grid labeling" with "ggml's flat byte layout" here was a real bug
+// caught by wiring this in (a diagnostic with one known nonzero weight
+// showed row 0's value leaking into unrelated output rows once read back
+// through a real ggml tensor - the raw pre-untilize tile data was already
+// correct, proving the bug was in this final relayout, not the kernel).
+// The reader kernel unpacks the weight straight from this backend's own
+// resident MeshBuffer (no re-upload - the whole point of Option B is that
+// the packed weight never needs to leave DRAM as anything but packed
+// bytes). The activation, however, has to be staged through host memory to
+// get transposed into [K,M] and tile-faced - matmul_tiles' operand
+// convention needs it that way (see the kernel README), and neither of
+// those is something this backend's generic buffer-type machinery does.
 static void ggml_backend_ttnn_compute_mul_mat(struct ggml_tensor * dst) {
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -360,36 +339,127 @@ static void ggml_backend_ttnn_compute_mul_mat(struct ggml_tensor * dst) {
     GGML_ASSERT(src0->type == GGML_TYPE_I2_S);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_backend_ttnn_mul_mat_shape_ok(src0, src1) &&
+                "ggml-ttnn: shape not offloadable - supports_op() should not have allowed this");
 
+    constexpr uint32_t TILE_DIM = 32;
     const uint32_t K = (uint32_t) src0->ne[0];
     const uint32_t N = (uint32_t) src0->ne[1];
     const uint32_t M = (uint32_t) src1->ne[1];
-    GGML_ASSERT((uint32_t) src1->ne[0] == K);
     GGML_ASSERT((uint32_t) dst->ne[0] == N && (uint32_t) dst->ne[1] == M);
+    const uint32_t Kt = K / TILE_DIM, Nt = N / TILE_DIM, Mt = M / TILE_DIM;
 
-    auto weight_buf = ggml_backend_ttnn_lookup(src0->buffer, src0);
-    std::vector<bfloat16> weight_host(N * K);
-    ggml_backend_ttnn_read_whole(weight_buf, weight_host.data());
-
+    auto weight_buf = ggml_backend_ttnn_lookup(src0->buffer, src0);  // resident packed I2_S bytes, reused as-is
     auto act_buf = ggml_backend_ttnn_lookup(src1->buffer, src1);
+    auto dst_buf = ggml_backend_ttnn_lookup(dst->buffer, dst);
+
+    // The per-tensor weight scale (quantize_i2_s / PORTING_PLAN.md sec 10)
+    // sits in the last 4 of the packed blob's 32 trailing bytes; reading the
+    // whole (small) blob to host is always safe here (offset 0, full size -
+    // see the buffer-type comment above), unlike a sub-range read.
+    std::vector<uint8_t> weight_host(weight_buf->size());
+    ggml_backend_ttnn_read_whole(weight_buf, weight_host.data());
+    float scale;
+    memcpy(&scale, weight_host.data() + (size_t) N * K / 4, sizeof(float));
+
+    // Activation, transposed to [K,M] (K outer) and tile-faced - see the
+    // kernel README for why matmul_tiles needs it this way round.
     std::vector<float> act_host(M * K);
     ggml_backend_ttnn_read_whole(act_buf, act_host.data());
+    std::vector<bfloat16> act_transposed(K * M);
+    for (uint32_t m = 0; m < M; m++) {
+        for (uint32_t k = 0; k < K; k++) {
+            act_transposed[k * M + m] = bfloat16(act_host[m * K + k]);
+        }
+    }
+    std::vector<bfloat16> act_tiled = tilize_nfaces(act_transposed, K, M);
 
     auto mesh_device = ggml_backend_ttnn_get_mesh_device();
-    const tt::tt_metal::MemoryConfig mem_cfg{tt::tt_metal::TensorMemoryLayout::INTERLEAVED, tt::tt_metal::BufferType::DRAM};
-    const tt::tt_metal::TensorLayout weight_layout(tt::tt_metal::DataType::BFLOAT16, tt::tt_metal::PageConfig(tt::tt_metal::Layout::TILE), mem_cfg);
-    const tt::tt_metal::TensorLayout act_layout(tt::tt_metal::DataType::FLOAT32, tt::tt_metal::PageConfig(tt::tt_metal::Layout::TILE), mem_cfg);
+    const uint32_t single_tile_size = sizeof(bfloat16) * tt::constants::TILE_HEIGHT * tt::constants::TILE_WIDTH;
 
-    ttnn::Tensor weight_t = ttnn::Tensor::from_vector(weight_host, ttnn::TensorSpec(ttnn::Shape({N, K}), weight_layout))
-                                 .to_device(mesh_device.get(), mem_cfg);
-    ttnn::Tensor act_t = ttnn::Tensor::from_vector(act_host, ttnn::TensorSpec(ttnn::Shape({M, K}), act_layout))
-                              .to_device(mesh_device.get(), mem_cfg);
+    ttd::DeviceLocalBufferConfig tile_dram_cfg{
+        /* .page_size   = */ single_tile_size, /* .buffer_type = */ tt::tt_metal::BufferType::DRAM};
+    auto act_dram = ttd::MeshBuffer::create(
+        ttd::ReplicatedBufferConfig{ /* .size = */ sizeof(bfloat16) * act_tiled.size()}, tile_dram_cfg, mesh_device.get());
+    auto out_dram = ttd::MeshBuffer::create(
+        ttd::ReplicatedBufferConfig{ /* .size = */ (size_t) single_tile_size * Nt * Mt}, tile_dram_cfg, mesh_device.get());
 
-    ttnn::Tensor out_t = ttnn::matmul(act_t, weight_t, /*transpose_a=*/false, /*transpose_b=*/true, mem_cfg);
+    tt::tt_metal::Program program{};
+    tt::tt_metal::CoreCoord core({0, 0});
+    tt::DataFormat bf16_fmt = tt::DataFormat::Float16_b;
 
-    std::vector<float> out_host = out_t.to_vector<float>();
+    uint32_t cb_in0 = tt::CBIndex::c_0;
+    tt::tt_metal::CreateCircularBuffer(
+        program, core,
+        tt::tt_metal::CircularBufferConfig(2 * single_tile_size, {{cb_in0, bf16_fmt}}).set_page_size(cb_in0, single_tile_size));
+    uint32_t cb_in1 = tt::CBIndex::c_1;
+    tt::tt_metal::CreateCircularBuffer(
+        program, core,
+        tt::tt_metal::CircularBufferConfig(2 * single_tile_size, {{cb_in1, bf16_fmt}}).set_page_size(cb_in1, single_tile_size));
+    uint32_t cb_out = tt::CBIndex::c_16;
+    tt::tt_metal::CreateCircularBuffer(
+        program, core,
+        tt::tt_metal::CircularBufferConfig(2 * single_tile_size, {{cb_out, bf16_fmt}}).set_page_size(cb_out, single_tile_size));
+    uint32_t cb_scratch = tt::CBIndex::c_2;
+    uint32_t weight_blob_size = (uint32_t) weight_buf->size();
+    tt::tt_metal::CreateCircularBuffer(
+        program, core,
+        tt::tt_metal::CircularBufferConfig(weight_blob_size, {{cb_scratch, tt::DataFormat::UInt8}})
+            .set_page_size(cb_scratch, weight_blob_size));
 
-    auto dst_buf = ggml_backend_ttnn_lookup(dst->buffer, dst);
+    std::vector<uint32_t> reader_compile_args;
+    tt::tt_metal::TensorAccessorArgs(*weight_buf).append_to(reader_compile_args);
+    tt::tt_metal::TensorAccessorArgs(*act_dram).append_to(reader_compile_args);
+    auto reader_id = tt::tt_metal::CreateKernel(
+        program, TERNARY_MATMUL_KERNEL_DIR "dataflow/reader_ternary_mm.cpp", core,
+        tt::tt_metal::DataMovementConfig{
+            .processor = tt::tt_metal::DataMovementProcessor::RISCV_1,
+            .noc = tt::tt_metal::NOC::RISCV_1_default,
+            .compile_args = reader_compile_args});
+
+    std::vector<uint32_t> writer_compile_args;
+    tt::tt_metal::TensorAccessorArgs(*out_dram).append_to(writer_compile_args);
+    auto writer_id = tt::tt_metal::CreateKernel(
+        program, TERNARY_MATMUL_KERNEL_DIR "dataflow/writer_ternary_mm.cpp", core,
+        tt::tt_metal::DataMovementConfig{
+            .processor = tt::tt_metal::DataMovementProcessor::RISCV_0,
+            .noc = tt::tt_metal::NOC::RISCV_0_default,
+            .compile_args = writer_compile_args});
+
+    std::vector<uint32_t> compute_compile_args = {Mt, Kt, Nt};
+    tt::tt_metal::CreateKernel(
+        program, TERNARY_MATMUL_KERNEL_DIR "compute/mm.cpp", core,
+        tt::tt_metal::ComputeConfig{.math_fidelity = tt::tt_metal::MathFidelity::HiFi4, .compile_args = compute_compile_args});
+
+    tt::tt_metal::SetRuntimeArgs(
+        program, reader_id, core, {(uint32_t) weight_buf->address(), (uint32_t) act_dram->address(), Mt, Kt, Nt, K});
+    tt::tt_metal::SetRuntimeArgs(program, writer_id, core, {(uint32_t) out_dram->address(), Mt, Nt});
+
+    ttd::MeshCommandQueue & cq = mesh_device->mesh_command_queue();
+    ttd::MeshWorkload workload;
+    ttd::MeshCoordinateRange device_range(mesh_device->shape());
+
+    ttd::EnqueueWriteMeshBuffer(cq, act_dram, act_tiled, /*blocking=*/false);
+    workload.add_program(device_range, std::move(program));
+    ttd::EnqueueMeshWorkload(cq, workload, /*blocking=*/false);
+
+    std::vector<bfloat16> result_tiled((size_t) Nt * Mt * TILE_DIM * TILE_DIM);
+    ttd::EnqueueReadMeshBuffer(cq, result_tiled, out_dram, /*blocking=*/true);
+    // N-outer/M-inner (the kernel's own tile-grid order, matching the
+    // writer's n*Mt+m page layout) - see the comment above this function
+    // for why this is NOT yet ggml's own dst byte layout.
+    std::vector<bfloat16> result = untilize_nfaces(result_tiled, N, M);
+
+    // Transpose into ggml's dst convention (M-outer/N-inner, ne0=N fastest)
+    // while applying the per-tensor weight scale - device output is the
+    // unscaled ternary dot product, not rescaled per-element in-kernel.
+    std::vector<float> out_host(N * M);
+    for (uint32_t n = 0; n < N; n++) {
+        for (uint32_t m = 0; m < M; m++) {
+            out_host[m * N + n] = (float) result[n * M + m] * scale;
+        }
+    }
+
     ggml_backend_ttnn_write_whole(dst_buf, out_host.data());
 }
 
@@ -516,7 +586,8 @@ static bool ggml_backend_ttnn_device_supports_op(ggml_backend_dev_t dev, const s
     }
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
-    return src0->type == GGML_TYPE_I2_S && src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+    return src0->type == GGML_TYPE_I2_S && src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+           ggml_backend_ttnn_mul_mat_shape_ok(src0, src1);
 }
 
 static bool ggml_backend_ttnn_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
