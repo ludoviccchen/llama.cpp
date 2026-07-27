@@ -101,20 +101,46 @@ static void * ggml_backend_ttnn_buffer_get_base(ggml_backend_buffer_t buffer) {
     return ((ggml_backend_ttnn_buffer_context *) buffer->context)->host_shadow;
 }
 
+// A view never gets its own MeshBuffer - it aliases into whichever non-view
+// ancestor tensor owns the buffer, at whatever byte offset tensor->data -
+// root->data works out to (walking view_src handles chained
+// views/reshapes/permutes transparently, since ggml always folds the final
+// pointer for us). Resolving this at *access* time rather than baking a
+// separate device allocation for every view means every real tt-metal
+// transfer still targets a whole buffer end-to-end (offset 0, full size) -
+// set_tensor/get_tensor/memset_tensor just shift their host-side
+// read-modify-write window by the view's offset - so the two upstream
+// interior-access bugs documented above never come into play, no matter how
+// the view slices its root tensor.
+static const struct ggml_tensor * ggml_backend_ttnn_root_tensor(const struct ggml_tensor * tensor) {
+    while (tensor->view_src != NULL) {
+        tensor = tensor->view_src;
+    }
+    return tensor;
+}
+
+struct ggml_backend_ttnn_located_buffer {
+    std::shared_ptr<ttd::MeshBuffer> buffer;
+    size_t offset;  // tensor's byte offset within `buffer`
+};
+
+static ggml_backend_ttnn_located_buffer ggml_backend_ttnn_locate(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor) {
+    const struct ggml_tensor * root = ggml_backend_ttnn_root_tensor(tensor);
+    ggml_backend_ttnn_buffer_context * ctx = (ggml_backend_ttnn_buffer_context *) buffer->context;
+    auto it = ctx->tensor_buffers.find(root->data);
+    GGML_ASSERT(it != ctx->tensor_buffers.end() && "ggml-ttnn: tensor has no device buffer (init_tensor not called?)");
+    size_t offset = (const uint8_t *) tensor->data - (const uint8_t *) root->data;
+    return { it->second, offset };
+}
+
 static enum ggml_status ggml_backend_ttnn_buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) {
     if (tensor->view_src != NULL) {
-        // ggml_gallocr wraps op outputs in a same-buffer, offset-0 "view of
-        // itself" for its own bookkeeping (seen with ggml_backend_sched:
-        // mul_mat's dst arrives here as a view of a GGML_OP_MUL_MAT source
-        // at view_offs 0) - since offset 0 means tensor->data ==
-        // view_src->data, the existing tensor_buffers entry for view_src
-        // (keyed by that same pointer, registered when view_src itself was
-        // init_tensor'd) already covers this tensor; nothing to do. Any
-        // other view - non-zero offset, i.e. a genuine sub-region of a
-        // buffer - would need interior device-buffer access, which isn't
-        // supported (see the buffer-type comment above).
-        GGML_ASSERT(tensor->view_offs == 0 && tensor->data == tensor->view_src->data &&
-                     "ggml-ttnn: only whole-tensor views are supported by the DRAM buffer type");
+        // Nothing to allocate here - see ggml_backend_ttnn_locate above.
+        // Just sanity-check the view actually lands inside its root
+        // tensor's buffer.
+        auto located = ggml_backend_ttnn_locate(buffer, tensor);
+        GGML_ASSERT(located.offset + ggml_nbytes(tensor) <= located.buffer->size() &&
+                     "ggml-ttnn: view extends past its root tensor's buffer");
         return GGML_STATUS_SUCCESS;
     }
 
@@ -139,10 +165,10 @@ static enum ggml_status ggml_backend_ttnn_buffer_init_tensor(ggml_backend_buffer
 }
 
 static std::shared_ptr<ttd::MeshBuffer> ggml_backend_ttnn_lookup(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor) {
-    ggml_backend_ttnn_buffer_context * ctx = (ggml_backend_ttnn_buffer_context *) buffer->context;
-    auto it = ctx->tensor_buffers.find(tensor->data);
-    GGML_ASSERT(it != ctx->tensor_buffers.end() && "ggml-ttnn: tensor has no device buffer (init_tensor not called?)");
-    return it->second;
+    // Callers that use this (compute_mul_mat) only ever see non-view
+    // tensors, where the located offset is always 0 - the buffer alone is
+    // all they need.
+    return ggml_backend_ttnn_locate(buffer, tensor).buffer;
 }
 
 static void ggml_backend_ttnn_write_whole(const std::shared_ptr<ttd::MeshBuffer> & mesh_buffer, const void * data) {
@@ -164,17 +190,18 @@ static void ggml_backend_ttnn_read_whole(const std::shared_ptr<ttd::MeshBuffer> 
 }
 
 static void ggml_backend_ttnn_buffer_memset_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
-    auto mesh_buffer = ggml_backend_ttnn_lookup(buffer, tensor);
-    size_t total = mesh_buffer->size();
-    if (offset == 0 && size == total) {
+    auto located = ggml_backend_ttnn_locate(buffer, tensor);
+    size_t total = located.buffer->size();
+    size_t abs_offset = located.offset + offset;
+    if (abs_offset == 0 && size == total) {
         std::vector<uint8_t> fill(total, value);
-        ggml_backend_ttnn_write_whole(mesh_buffer, fill.data());
+        ggml_backend_ttnn_write_whole(located.buffer, fill.data());
         return;
     }
     std::vector<uint8_t> scratch(total);
-    ggml_backend_ttnn_read_whole(mesh_buffer, scratch.data());
-    memset(scratch.data() + offset, value, size);
-    ggml_backend_ttnn_write_whole(mesh_buffer, scratch.data());
+    ggml_backend_ttnn_read_whole(located.buffer, scratch.data());
+    memset(scratch.data() + abs_offset, value, size);
+    ggml_backend_ttnn_write_whole(located.buffer, scratch.data());
 }
 
 static void ggml_backend_ttnn_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
@@ -182,29 +209,32 @@ static void ggml_backend_ttnn_buffer_set_tensor(ggml_backend_buffer_t buffer, st
     // to the gguf file - Option B's reader kernel does the ternary unpack
     // on-device at compute time, so there's nothing type-specific to do
     // here; this is the same generic whole-buffer-or-read-modify-write path
-    // every other type uses.
-    auto mesh_buffer = ggml_backend_ttnn_lookup(buffer, tensor);
-    size_t total = mesh_buffer->size();
-    if (offset == 0 && size == total) {
-        ggml_backend_ttnn_write_whole(mesh_buffer, data);
+    // every other type uses. `located.offset` folds in any view offset on
+    // top of the caller-supplied `offset`.
+    auto located = ggml_backend_ttnn_locate(buffer, tensor);
+    size_t total = located.buffer->size();
+    size_t abs_offset = located.offset + offset;
+    if (abs_offset == 0 && size == total) {
+        ggml_backend_ttnn_write_whole(located.buffer, data);
         return;
     }
     std::vector<uint8_t> scratch(total);
-    ggml_backend_ttnn_read_whole(mesh_buffer, scratch.data());
-    memcpy(scratch.data() + offset, data, size);
-    ggml_backend_ttnn_write_whole(mesh_buffer, scratch.data());
+    ggml_backend_ttnn_read_whole(located.buffer, scratch.data());
+    memcpy(scratch.data() + abs_offset, data, size);
+    ggml_backend_ttnn_write_whole(located.buffer, scratch.data());
 }
 
 static void ggml_backend_ttnn_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
-    auto mesh_buffer = ggml_backend_ttnn_lookup(buffer, tensor);
-    size_t total = mesh_buffer->size();
-    if (offset == 0 && size == total) {
-        ggml_backend_ttnn_read_whole(mesh_buffer, data);
+    auto located = ggml_backend_ttnn_locate(buffer, tensor);
+    size_t total = located.buffer->size();
+    size_t abs_offset = located.offset + offset;
+    if (abs_offset == 0 && size == total) {
+        ggml_backend_ttnn_read_whole(located.buffer, data);
         return;
     }
     std::vector<uint8_t> scratch(total);
-    ggml_backend_ttnn_read_whole(mesh_buffer, scratch.data());
-    memcpy(data, scratch.data() + offset, size);
+    ggml_backend_ttnn_read_whole(located.buffer, scratch.data());
+    memcpy(data, scratch.data() + abs_offset, size);
 }
 
 static void ggml_backend_ttnn_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
@@ -349,9 +379,22 @@ static void ggml_backend_ttnn_compute_mul_mat(struct ggml_tensor * dst) {
     GGML_ASSERT((uint32_t) dst->ne[0] == N && (uint32_t) dst->ne[1] == M);
     const uint32_t Kt = K / TILE_DIM, Nt = N / TILE_DIM, Mt = M / TILE_DIM;
 
-    auto weight_buf = ggml_backend_ttnn_lookup(src0->buffer, src0);  // resident packed I2_S bytes, reused as-is
-    auto act_buf = ggml_backend_ttnn_lookup(src1->buffer, src1);
-    auto dst_buf = ggml_backend_ttnn_lookup(dst->buffer, dst);
+    // The weight is consumed directly from its own resident device buffer
+    // (the reader kernel addresses it on-device - the whole point of
+    // Option B), so it must be the sole occupant of that buffer, not a
+    // sub-view of something bigger; dst likewise, since the final write
+    // below targets it directly. src1 has no such restriction below - it's
+    // always staged through host memory anyway (transposed + tile-faced),
+    // so a genuine sliced view is fine there and handled via the ordinary
+    // get_tensor/set_tensor path (see ggml_backend_ttnn_locate).
+    auto weight_located = ggml_backend_ttnn_locate(src0->buffer, src0);
+    GGML_ASSERT(weight_located.offset == 0 &&
+                "ggml-ttnn: mul_mat weight (src0) must not be a nonzero-offset view");
+    auto weight_buf = weight_located.buffer;
+    auto dst_located = ggml_backend_ttnn_locate(dst->buffer, dst);
+    GGML_ASSERT(dst_located.offset == 0 && ggml_nbytes(dst) == dst_located.buffer->size() &&
+                "ggml-ttnn: mul_mat dst must not be a view");
+    auto dst_buf = dst_located.buffer;
 
     // The per-tensor weight scale (quantize_i2_s / PORTING_PLAN.md sec 10)
     // sits in the last 4 of the packed blob's 32 trailing bytes; reading the
@@ -363,9 +406,11 @@ static void ggml_backend_ttnn_compute_mul_mat(struct ggml_tensor * dst) {
     memcpy(&scale, weight_host.data() + (size_t) N * K / 4, sizeof(float));
 
     // Activation, transposed to [K,M] (K outer) and tile-faced - see the
-    // kernel README for why matmul_tiles needs it this way round.
+    // kernel README for why matmul_tiles needs it this way round. Goes
+    // through the generic get_tensor path (not a raw whole-buffer read)
+    // specifically so a sliced (nonzero-offset) view works here.
     std::vector<float> act_host(M * K);
-    ggml_backend_ttnn_read_whole(act_buf, act_host.data());
+    ggml_backend_ttnn_buffer_get_tensor(src1->buffer, src1, act_host.data(), 0, (size_t) M * K * sizeof(float));
     std::vector<bfloat16> act_transposed(K * M);
     for (uint32_t m = 0; m < M; m++) {
         for (uint32_t k = 0; k < K; k++) {
@@ -463,6 +508,88 @@ static void ggml_backend_ttnn_compute_mul_mat(struct ggml_tensor * dst) {
     ggml_backend_ttnn_write_whole(dst_buf, out_host.data());
 }
 
+// GGML_OP_SET_ROWS: writes rows of `src0` (F32) into `dst` at the row
+// positions given by `src1` (I32/I64 indices) - the KV-cache-write op
+// (`ggml_set_rows(ctx, a, b, c)` returns `view(a)`, so `dst` here is always
+// a whole-tensor view of the real destination, `dst->view_src`). Mirrors
+// ggml-cpu's own `ggml_compute_forward_set_rows_f32` (ggml-cpu/ops.cpp)
+// element-for-element - same loop structure, same broadcast rules - just
+// operating on host-side copies of this backend's buffers instead of the
+// CPU's own tensor memory, and using ggml core's portable `from_float_ref`
+// (no need to link ggml-cpu just for its SIMD one) to convert into
+// whatever type the destination actually stores (F16 for a typical KV
+// cache, but not assumed - whatever supports_op() already checked).
+template <typename idx_t>
+static void ggml_backend_ttnn_set_rows_apply(
+        uint8_t * a_host, const struct ggml_tensor * a,
+        const uint8_t * rows_host, const struct ggml_tensor * src0,
+        const uint8_t * idx_host, const struct ggml_tensor * src1,
+        ggml_from_float_t from_float) {
+    const int64_t nc   = src0->ne[0];
+    const int64_t nr   = src0->ne[1];
+    const int64_t ne02 = src0->ne[2];
+    const int64_t ne03 = src0->ne[3];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t ne12 = src1->ne[2];
+    const int64_t ne1  = a->ne[1];
+    GGML_ASSERT(a->ne[0] == nc && a->ne[2] == ne02 && a->ne[3] == ne03);
+
+    for (int64_t i03 = 0; i03 < ne03; i03++) {
+        for (int64_t i02 = 0; i02 < ne02; i02++) {
+            for (int64_t i = 0; i < nr; i++) {
+                const int64_t i12 = i03 % ne12;
+                const int64_t i11 = i02 % ne11;
+                idx_t i1;
+                memcpy(&i1, idx_host + i * src1->nb[0] + i11 * src1->nb[1] + i12 * src1->nb[2], sizeof(idx_t));
+                GGML_ASSERT(i1 >= 0 && i1 < ne1);
+
+                const float * src_row = (const float *) (rows_host + i * src0->nb[1] + i02 * src0->nb[2] + i03 * src0->nb[3]);
+                void * dst_row = a_host + (size_t) i1 * a->nb[1] + i02 * a->nb[2] + i03 * a->nb[3];
+                from_float(src_row, dst_row, nc);
+            }
+        }
+    }
+}
+
+static void ggml_backend_ttnn_compute_set_rows(struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0]; // new row data, F32
+    const struct ggml_tensor * src1 = dst->src[1]; // row indices, I32/I64
+    struct ggml_tensor * a = dst->view_src;        // real destination (e.g. a KV-cache tensor)
+    GGML_ASSERT(a != NULL && "ggml-ttnn: SET_ROWS dst should always be a view of its destination (ggml_set_rows)");
+
+    // Same whole-buffer-only pattern as everywhere else in this backend
+    // (sec 9/16): `a` must be the sole occupant of its buffer (true for a
+    // real KV-cache tensor, never itself a sub-view) so this is a plain
+    // read-modify-write over the entire thing, not an interior access.
+    auto a_located = ggml_backend_ttnn_locate(a->buffer, a);
+    GGML_ASSERT(a_located.offset == 0 && ggml_nbytes(a) == a_located.buffer->size() &&
+                "ggml-ttnn: SET_ROWS destination must be the sole occupant of its buffer");
+
+    const struct ggml_type_traits * type_traits = ggml_get_type_traits(a->type);
+    GGML_ASSERT(type_traits->from_float_ref != NULL &&
+                "ggml-ttnn: no from_float conversion for this dst type - supports_op() should not have allowed this");
+
+    std::vector<uint8_t> a_host(a_located.buffer->size());
+    ggml_backend_ttnn_read_whole(a_located.buffer, a_host.data());
+
+    std::vector<uint8_t> rows_host(ggml_nbytes(src0));
+    ggml_backend_ttnn_buffer_get_tensor(src0->buffer, src0, rows_host.data(), 0, rows_host.size());
+
+    std::vector<uint8_t> idx_host(ggml_nbytes(src1));
+    ggml_backend_ttnn_buffer_get_tensor(src1->buffer, src1, idx_host.data(), 0, idx_host.size());
+
+    if (src1->type == GGML_TYPE_I64) {
+        ggml_backend_ttnn_set_rows_apply<int64_t>(
+            a_host.data(), a, rows_host.data(), src0, idx_host.data(), src1, type_traits->from_float_ref);
+    } else {
+        GGML_ASSERT(src1->type == GGML_TYPE_I32);
+        ggml_backend_ttnn_set_rows_apply<int32_t>(
+            a_host.data(), a, rows_host.data(), src0, idx_host.data(), src1, type_traits->from_float_ref);
+    }
+
+    ggml_backend_ttnn_write_whole(a_located.buffer, a_host.data());
+}
+
 static enum ggml_status ggml_backend_ttnn_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_UNUSED(backend);
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -470,6 +597,9 @@ static enum ggml_status ggml_backend_ttnn_graph_compute(ggml_backend_t backend, 
         switch (node->op) {
             case GGML_OP_MUL_MAT:
                 ggml_backend_ttnn_compute_mul_mat(node);
+                break;
+            case GGML_OP_SET_ROWS:
+                ggml_backend_ttnn_compute_set_rows(node);
                 break;
             case GGML_OP_NONE:
             case GGML_OP_RESHAPE:
@@ -571,23 +701,42 @@ static ggml_backend_buffer_type_t ggml_backend_ttnn_device_get_buffer_type(ggml_
 
 static bool ggml_backend_ttnn_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    // GGML_OP_NONE is a real leaf (e.g. a weight tensor already sitting in
-    // this backend's buffer, no view) - the scheduler queries supports_op()
-    // for these too (ggml_backend_sched_backend_from_buffer), and they need
-    // no compute. VIEW/RESHAPE/TRANSPOSE/PERMUTE are NOT included here even
-    // though graph_compute() tolerates them: the buffer type's init_tensor
-    // hard-rejects tensor->view_src != NULL (see comment there), so the
-    // scheduler must never be told this device can take a real view op.
-    if (op->op == GGML_OP_NONE) {
+    // GGML_OP_NONE is a real leaf (e.g. a weight or KV-cache tensor already
+    // sitting in this backend's buffer, no view) - the scheduler queries
+    // supports_op() for these too (ggml_backend_sched_backend_from_buffer),
+    // and they need no compute. VIEW/RESHAPE/TRANSPOSE/PERMUTE are real graph
+    // nodes (not pre-allocated leaves) whose own dst is a view of one of
+    // their sources - in ggml these are always pure metadata ops (new
+    // ne[]/nb[]/view_src/view_offs over the *same* underlying data, see
+    // ggml_view_tensor/ggml_reshape/ggml_permute/ggml_transpose in ggml.c),
+    // never data movement, so they're safe here now that the buffer type
+    // can hold a view at all (sec 16) - graph_compute() already treats all
+    // four as no-ops, this just lets the scheduler actually route them to
+    // this device instead of aborting on a KV-cache-derived view (found
+    // when enabling SET_ROWS surfaced the very next node needing this, a
+    // plain VIEW of the KV cache for attention).
+    if (op->op == GGML_OP_NONE || op->op == GGML_OP_VIEW || op->op == GGML_OP_RESHAPE ||
+        op->op == GGML_OP_TRANSPOSE || op->op == GGML_OP_PERMUTE) {
         return true;
     }
-    if (op->op != GGML_OP_MUL_MAT) {
-        return false;
+    if (op->op == GGML_OP_MUL_MAT) {
+        const struct ggml_tensor * src0 = op->src[0];
+        const struct ggml_tensor * src1 = op->src[1];
+        return src0->type == GGML_TYPE_I2_S && src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+               ggml_backend_ttnn_mul_mat_shape_ok(src0, src1);
     }
-    const struct ggml_tensor * src0 = op->src[0];
-    const struct ggml_tensor * src1 = op->src[1];
-    return src0->type == GGML_TYPE_I2_S && src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
-           ggml_backend_ttnn_mul_mat_shape_ok(src0, src1);
+    if (op->op == GGML_OP_SET_ROWS) {
+        // The KV-cache write op (ggml_set_rows(ctx, a, b, c), dst = view(a)):
+        // b (op->src[0]) must be F32 and c (op->src[1]) I32/I64 - the same
+        // restriction ggml-cpu's own implementation has (ggml-cpu/ops.cpp,
+        // ggml_compute_forward_set_rows) - and the destination type (op->type,
+        // same as a's) needs a from_float conversion to exist at all.
+        const struct ggml_tensor * src0 = op->src[0];
+        const struct ggml_tensor * src1 = op->src[1];
+        return src0->type == GGML_TYPE_F32 && (src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32) &&
+               ggml_get_type_traits(op->type)->from_float_ref != NULL;
+    }
+    return false;
 }
 
 static bool ggml_backend_ttnn_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {

@@ -1785,6 +1785,14 @@ static struct ggml_tensor * ggml_new_tensor_impl(
     for (int i = 1; i < n_dims; i++) {
         data_size *= ne[i];
     }
+    // BitNet I2_S/TL1: ggml_row_size()/blck_size don't know about the packed
+    // (4 elements/byte) + trailing-scale layout - mirror ggml_nbytes()'s own
+    // special case here so this stays consistent with it (data_size is
+    // compared against ggml_nbytes(view_src) right below, and is also the
+    // real allocation size for a plain, non-view tensor of this type).
+    if (type == GGML_TYPE_I2_S || type == GGML_TYPE_TL1) {
+        data_size = data_size / 4 + 32;
+    }
 
     GGML_ASSERT(view_src == NULL || data_size == 0 || data_size + view_offs <= ggml_nbytes(view_src));
 
