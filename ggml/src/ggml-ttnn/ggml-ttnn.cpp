@@ -332,6 +332,25 @@ static bool ggml_backend_ttnn_mul_mat_shape_ok(const struct ggml_tensor * src0, 
     // K a multiple of 128: one I2_S packing super-block never straddles a
     // row (reader kernel's row-stride assumption). N/M tile-aligned: the FPU
     // only operates on whole 32x32 tiles.
+    //
+    // compute_mul_mat below can in fact handle any M >= 1 (it pads up to the
+    // next tile boundary on upload and truncates the result back down before
+    // writing dst - PORTING_PLAN.md sec 22) - that padding path is real and
+    // separately verified correct. The M%32==0 gate here is deliberately
+    // kept anyway: relaxing it makes ordinary single-token decode (M=1)
+    // reach this backend for the first time (sec 21 found it never did
+    // before), which surfaces a much bigger, separate problem - the reader
+    // kernel's O(Nt*Kt*1024) scalar unpack loop takes minutes per call at
+    // real projection-matrix dimensions under ttsim (measured: a single
+    // K=2560,N=2560 call did not finish in over 580s), because the old gate
+    // had incidentally kept virtually all real per-layer decode-time matmuls
+    // away from this kernel entirely. Enabling M-padding by default would
+    // turn the existing, validated `-ngl 99` smoke test from ~20s-2min into
+    // many minutes-to-hours, for a problem the padding fix doesn't cause and
+    // can't fix (sec 22). Restoring this constraint keeps today's demo fast;
+    // lifting it again is the natural next step once the reader kernel's
+    // unpack loop is vectorized/optimized enough to be practical at real N/K
+    // scale under ttsim.
     return src1->ne[0] == K && K % 128 == 0 && N % TILE_DIM == 0 && M % TILE_DIM == 0;
 }
 
@@ -377,7 +396,19 @@ static void ggml_backend_ttnn_compute_mul_mat(struct ggml_tensor * dst) {
     const uint32_t N = (uint32_t) src0->ne[1];
     const uint32_t M = (uint32_t) src1->ne[1];
     GGML_ASSERT((uint32_t) dst->ne[0] == N && (uint32_t) dst->ne[1] == M);
-    const uint32_t Kt = K / TILE_DIM, Nt = N / TILE_DIM, Mt = M / TILE_DIM;
+    const uint32_t Kt = K / TILE_DIM, Nt = N / TILE_DIM;
+    // Round up to a whole number of M-tiles. supports_op() currently still
+    // requires M%32==0 (ggml_backend_ttnn_mul_mat_shape_ok, PORTING_PLAN.md
+    // sec 22), so M_padded == M for every M this function is actually called
+    // with today - but the logic below handles a non-tile-aligned M
+    // correctly regardless (separately verified), ready for when
+    // supports_op's M constraint is lifted once the reader kernel's unpack
+    // loop is fast enough to make that practical. The kernel triad itself is
+    // unaffected either way (it always operates on whole tiles); any padding
+    // rows are zero-filled below and dropped again once the result comes
+    // back, invisible to it.
+    const uint32_t Mt = (M + TILE_DIM - 1) / TILE_DIM;
+    const uint32_t M_padded = Mt * TILE_DIM;
 
     // The weight is consumed directly from its own resident device buffer
     // (the reader kernel addresses it on-device - the whole point of
@@ -405,19 +436,23 @@ static void ggml_backend_ttnn_compute_mul_mat(struct ggml_tensor * dst) {
     float scale;
     memcpy(&scale, weight_host.data() + (size_t) N * K / 4, sizeof(float));
 
-    // Activation, transposed to [K,M] (K outer) and tile-faced - see the
-    // kernel README for why matmul_tiles needs it this way round. Goes
+    // Activation, transposed to [K,M_padded] (K outer) and tile-faced - see
+    // the kernel README for why matmul_tiles needs it this way round. Goes
     // through the generic get_tensor path (not a raw whole-buffer read)
-    // specifically so a sliced (nonzero-offset) view works here.
+    // specifically so a sliced (nonzero-offset) view works here. Columns
+    // [M, M_padded) are left zero (act_transposed's sized-constructor
+    // value-initializes them) - padding rows of an all-zero activation, so
+    // the kernel's extra output rows for them are simply zero times the
+    // ternary weight, discarded below rather than written to dst.
     std::vector<float> act_host(M * K);
     ggml_backend_ttnn_buffer_get_tensor(src1->buffer, src1, act_host.data(), 0, (size_t) M * K * sizeof(float));
-    std::vector<bfloat16> act_transposed(K * M);
+    std::vector<bfloat16> act_transposed(K * M_padded);
     for (uint32_t m = 0; m < M; m++) {
         for (uint32_t k = 0; k < K; k++) {
-            act_transposed[k * M + m] = bfloat16(act_host[m * K + k]);
+            act_transposed[k * M_padded + m] = bfloat16(act_host[m * K + k]);
         }
     }
-    std::vector<bfloat16> act_tiled = tilize_nfaces(act_transposed, K, M);
+    std::vector<bfloat16> act_tiled = tilize_nfaces(act_transposed, K, M_padded);
 
     auto mesh_device = ggml_backend_ttnn_get_mesh_device();
     const uint32_t single_tile_size = sizeof(bfloat16) * tt::constants::TILE_HEIGHT * tt::constants::TILE_WIDTH;
@@ -495,18 +530,21 @@ static void ggml_backend_ttnn_compute_mul_mat(struct ggml_tensor * dst) {
 
     std::vector<bfloat16> result_tiled((size_t) Nt * Mt * TILE_DIM * TILE_DIM);
     ttd::EnqueueReadMeshBuffer(cq, result_tiled, out_dram, /*blocking=*/true);
-    // N-outer/M-inner (the kernel's own tile-grid order, matching the
+    // N-outer/M_padded-inner (the kernel's own tile-grid order, matching the
     // writer's n*Mt+m page layout) - see the comment above this function
     // for why this is NOT yet ggml's own dst byte layout.
-    std::vector<bfloat16> result = untilize_nfaces(result_tiled, N, M);
+    std::vector<bfloat16> result = untilize_nfaces(result_tiled, N, M_padded);
 
     // Transpose into ggml's dst convention (M-outer/N-inner, ne0=N fastest)
     // while applying the per-tensor weight scale - device output is the
-    // unscaled ternary dot product, not rescaled per-element in-kernel.
+    // unscaled ternary dot product, not rescaled per-element in-kernel. Only
+    // the real M rows are written; columns [M, M_padded) were all-zero
+    // padding activation rows (see above) and are dropped here rather than
+    // written to dst.
     std::vector<float> out_host(N * M);
     for (uint32_t n = 0; n < N; n++) {
         for (uint32_t m = 0; m < M; m++) {
-            out_host[m * N + n] = (float) result[n * M + m] * scale;
+            out_host[m * N + n] = (float) result[n * M_padded + m] * scale;
         }
     }
 
