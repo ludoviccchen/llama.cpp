@@ -445,12 +445,17 @@ static void ggml_backend_ttnn_compute_mul_mat(struct ggml_tensor * dst) {
     tt::tt_metal::CreateCircularBuffer(
         program, core,
         tt::tt_metal::CircularBufferConfig(2 * single_tile_size, {{cb_out, bf16_fmt}}).set_page_size(cb_out, single_tile_size));
+    // Reader kernel streams one N-tile's packed weight row-block at a time
+    // (see kernels/ternary_matmul/dataflow/reader_ternary_mm.cpp) rather than
+    // keeping the whole N*K/4-byte blob resident in L1 - bounds this CB's
+    // size to a single N-tile regardless of N, which is what makes real
+    // model-sized weight matrices fit.
     uint32_t cb_scratch = tt::CBIndex::c_2;
-    uint32_t weight_blob_size = (uint32_t) weight_buf->size();
+    uint32_t weight_chunk_size = TILE_DIM * (K / 4);
     tt::tt_metal::CreateCircularBuffer(
         program, core,
-        tt::tt_metal::CircularBufferConfig(weight_blob_size, {{cb_scratch, tt::DataFormat::UInt8}})
-            .set_page_size(cb_scratch, weight_blob_size));
+        tt::tt_metal::CircularBufferConfig(weight_chunk_size, {{cb_scratch, tt::DataFormat::UInt8}})
+            .set_page_size(cb_scratch, weight_chunk_size));
 
     std::vector<uint32_t> reader_compile_args;
     tt::tt_metal::TensorAccessorArgs(*weight_buf).append_to(reader_compile_args);

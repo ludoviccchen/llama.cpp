@@ -27,11 +27,17 @@ validation results.
 ## Current scope
 
 Handles arbitrary Mt/Kt/Nt (multiple M-tiles, N-tiles, and K
-super-blocks/row - see PORTING_PLAN.md sec 14), but the whole packed weight
-blob is read once into a scratch L1 CB and kept resident for the entire
-kernel - correct, but doesn't scale to real-model-sized weights (the blob
-has to fit in L1 alongside everything else). Chunked/streamed weight reads
-are follow-up work before this is usable on realistic dimensions.
+super-blocks/row - see PORTING_PLAN.md sec 14). The reader streams one
+N-tile's packed weight row-block (32 rows x K/4 bytes) into a scratch L1 CB
+at a time, refreshed per (mt, nt) pair, rather than keeping the whole
+N*K/4-byte blob resident - see PORTING_PLAN.md sec 20. This bounds L1 usage
+to a fixed size per weight tensor regardless of N (verified against a real
+2B-param model's projection matrices: the old whole-blob approach needed up
+to 4.3MB resident per tensor, well over a Blackhole core's ~1.5MB L1; the
+chunked version needs 20-54KB). The tradeoff is redundant DRAM reads (the
+weight is re-fetched once per M-tile, since it doesn't vary with mt) -
+acceptable since hardware performance work is explicitly out of scope until
+real silicon is available (PORTING_PLAN.md sec 8).
 
 ## Status
 
