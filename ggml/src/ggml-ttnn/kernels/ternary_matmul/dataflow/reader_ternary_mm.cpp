@@ -20,10 +20,13 @@
 // 0 -> -1, 1 -> 0, 2 -> +1, 3 unused.
 //
 // A 32-wide K-tile `kt` sits inside super-block `kt/4` at lane `kt%4`
-// (four 32-wide K-tiles share each 128-element super-block). Row `row`'s
-// packed data starts at byte offset `row*(K/4)` within the whole tensor's
-// packed blob (K/4 bytes/row, assuming K is a multiple of 128 - true for
-// realistic transformer dims - so no super-block ever straddles a row).
+// (four 32-wide K-tiles share each 128-element super-block, and K%128==0
+// - required by ggml_backend_ttnn_mul_mat_shape_ok - guarantees Kt=K/32 is
+// always a multiple of 4, i.e. superblocks never split across a Kt
+// boundary). Row `row`'s packed data starts at byte offset `row*(K/4)`
+// within the whole tensor's packed blob (K/4 bytes/row, assuming K is a
+// multiple of 128 - true for realistic transformer dims - so no
+// super-block ever straddles a row).
 //
 // Tile-face layout (tech_reports/tensor_layouts/tensor_layouts.md): each
 // 32x32 tile is 4 faces of 16x16, stored face0(top-left)->face1(top-right)
@@ -44,6 +47,19 @@
 // pair - the weight doesn't vary with mt, so this redundantly re-reads it Mt
 // times total, the same "redundant but simple" tradeoff already used below
 // for the activation tiles, traded here for bounded L1 footprint.
+//
+// Unpack cost (PORTING_PLAN.md sec 23): the per-element work below runs on
+// this data-movement RISC-V core, not the FPU/SFPU compute engine, so it is
+// scalar by construction - at real transformer dimensions (e.g. K=N=2560)
+// that is Nt*Kt*1024 ~= 6.5M elements per matmul call, which measurably does
+// not complete in reasonable time under ttsim. Two structural changes below
+// cut real per-element cost without changing the math: (1) the row/col ->
+// tile-face index is invariant across every (mt, nt, kt) visited - hoisted
+// out of the hot loop into a table computed once, instead of being
+// recomputed (with a division/modulo chain) on every single element visit;
+// (2) the four K-tiles sharing a superblock read the exact same packed byte
+// per row - unpacked together from one L1 byte load instead of four
+// separate passes each redundantly reloading and redecoding the same bytes.
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
@@ -56,7 +72,7 @@ void kernel_main() {
     uint32_t Nt = get_arg_val<uint32_t>(4);
     uint32_t K = get_arg_val<uint32_t>(5);  // needed for the bytes-per-row stride (K/4)
 
-    constexpr uint32_t cb_id_in0 = 0;      // unpacked ternary weight tiles (bf16)
+    constexpr uint32_t cb_id_in0 = 0;      // unpacked ternary weight tiles (bf16), 4 (one superblock) per push
     constexpr uint32_t cb_id_in1 = 1;      // activation tiles (bf16)
     constexpr uint32_t cb_id_scratch = 2;  // one N-tile's packed weight row-block, refreshed per (mt, nt)
 
@@ -64,6 +80,7 @@ void kernel_main() {
     constexpr uint32_t FACE_DIM = 16;
     constexpr uint32_t FACE_HW = FACE_DIM * FACE_DIM;          // 256
     constexpr uint32_t TILE_ROW_STRIDE = FACE_DIM * TILE_DIM;  // 512
+    constexpr uint32_t TILE_ELEMS = TILE_DIM * TILE_DIM;       // 1024
 
     // bfloat16 bit patterns (top 16 bits of IEEE754 float32): +1.0 = 0x3F80,
     // -1.0 = 0xBF80, 0.0 = 0x0000.
@@ -71,8 +88,30 @@ void kernel_main() {
     constexpr uint16_t BF16_NEG_ONE = 0xBF80;
     constexpr uint16_t BF16_ZERO = 0x0000;
 
+    auto decode = [](uint8_t code) -> uint16_t {
+        return (code == 0) ? BF16_NEG_ONE : (code == 2) ? BF16_POS_ONE : BF16_ZERO;
+    };
+
+    // row/col -> tile-face offset, computed once (1024 iterations total,
+    // regardless of Mt/Nt/Kt) instead of once per element visited (up to
+    // Mt*Nt*Kt*1024 times in the old version - the dominant cost at real
+    // model dimensions).
+    uint16_t face_idx[TILE_ELEMS];
+    for (uint32_t row = 0; row < TILE_DIM; row++) {
+        uint32_t face_y = row / FACE_DIM;
+        uint32_t local_row = row % FACE_DIM;
+        uint32_t row_off = face_y * TILE_ROW_STRIDE + local_row * FACE_DIM;
+        for (uint32_t c = 0; c < TILE_DIM; c++) {
+            uint32_t face_x = c / FACE_DIM;
+            uint32_t local_col = c % FACE_DIM;
+            face_idx[row * TILE_DIM + c] = (uint16_t)(row_off + face_x * FACE_HW + local_col);
+        }
+    }
+
     const uint32_t bytes_per_row = K / 4;
     const uint32_t weight_chunk_bytes = TILE_DIM * bytes_per_row;  // one N-tile's row-block
+    const uint32_t Sb = Kt / 4;  // superblocks per row-chunk; Kt % 4 == 0 always (see header comment)
+    constexpr uint32_t weight_tile_bytes = TILE_ELEMS * sizeof(uint16_t);
 
     constexpr auto weight_args = TensorAccessorArgs<0>();
     const auto weight_accessor = TensorAccessor(weight_args, weight_addr);
@@ -96,37 +135,39 @@ void kernel_main() {
             cb_push_back(cb_id_scratch, 1);
             volatile tt_l1_ptr uint8_t* packed = (volatile tt_l1_ptr uint8_t*)scratch_addr;
 
-            for (uint32_t kt = 0; kt < Kt; kt++) {
-                // Unpack this (nt, kt) 32x32 ternary weight block directly
-                // into tile-face order.
-                cb_reserve_back(cb_id_in0, 1);
-                uint32_t w_tile_addr = get_write_ptr(cb_id_in0);
-                volatile tt_l1_ptr uint16_t* w_tile = (volatile tt_l1_ptr uint16_t*)w_tile_addr;
-
-                uint32_t superblock = kt / 4;
-                uint32_t lane = kt % 4;
-                uint32_t shift = 6 - 2 * lane;
+            for (uint32_t sb = 0; sb < Sb; sb++) {
+                // Unpack all four K-tiles sharing superblock `sb` together:
+                // reserve their four output tiles up front (contiguous in
+                // the CB, standard multi-page reserve/fill/push pattern), and
+                // fill them from a single pass over their shared 32x32
+                // packed-byte block - one L1 byte load feeds all four lanes,
+                // instead of four separate passes each reloading and
+                // redecoding the same bytes.
+                cb_reserve_back(cb_id_in0, 4);
+                uint32_t base_tile_addr = get_write_ptr(cb_id_in0);
+                volatile tt_l1_ptr uint16_t* w_tile[4];
+                for (uint32_t lane = 0; lane < 4; lane++) {
+                    w_tile[lane] = (volatile tt_l1_ptr uint16_t*)(base_tile_addr + lane * weight_tile_bytes);
+                }
 
                 for (uint32_t row = 0; row < TILE_DIM; row++) {
                     // `row` is already local to this chunk (chunk holds
-                    // exactly this nt's 32 rows), unlike the old whole-blob
-                    // indexing which needed nt*TILE_DIM+row into the full
-                    // tensor.
-                    uint32_t row_base = row * bytes_per_row + superblock * TILE_DIM;
+                    // exactly this nt's 32 rows).
+                    uint32_t row_base = row * bytes_per_row + sb * TILE_DIM;
+                    const uint16_t* idx_row = &face_idx[row * TILE_DIM];
                     for (uint32_t c = 0; c < TILE_DIM; c++) {
                         uint8_t byte = packed[row_base + c];
-                        uint8_t code = (byte >> shift) & 0x3;
-                        uint16_t bits = (code == 0) ? BF16_NEG_ONE : (code == 2) ? BF16_POS_ONE : BF16_ZERO;
-
-                        uint32_t face_y = row / FACE_DIM;
-                        uint32_t face_x = c / FACE_DIM;
-                        uint32_t local_row = row % FACE_DIM;
-                        uint32_t local_col = c % FACE_DIM;
-                        uint32_t idx = face_y * TILE_ROW_STRIDE + face_x * FACE_HW + local_row * FACE_DIM + local_col;
-                        w_tile[idx] = bits;
+                        uint32_t idx = idx_row[c];
+                        // Bit layout (see header comment): lane 0 in
+                        // [7:6], lane 1 in [5:4], lane 2 in [3:2], lane 3 in
+                        // [1:0] - matches kt = sb*4 + lane below.
+                        w_tile[0][idx] = decode((byte >> 6) & 0x3);
+                        w_tile[1][idx] = decode((byte >> 4) & 0x3);
+                        w_tile[2][idx] = decode((byte >> 2) & 0x3);
+                        w_tile[3][idx] = decode(byte & 0x3);
                     }
                 }
-                cb_push_back(cb_id_in0, 1);
+                cb_push_back(cb_id_in0, 4);
 
                 // Read the matching activation tile (dense bf16, already
                 // tile-faced on the host - nothing special to unpack). The
@@ -138,13 +179,20 @@ void kernel_main() {
                 // Constant across nt, but the compute kernel consumes one
                 // push per (mt, nt, kt) visited, so it's re-read here each
                 // time - same redundant-but-simple pattern as the stock
-                // matmul_multi_core reader kernel this is modeled on.
-                uint32_t a_tile_index = kt * Mt + mt;
-                cb_reserve_back(cb_id_in1, 1);
-                uint32_t a_addr = get_write_ptr(cb_id_in1);
-                noc_async_read_page(a_tile_index, act_accessor, a_addr);
-                noc_async_read_barrier();
-                cb_push_back(cb_id_in1, 1);
+                // matmul_multi_core reader kernel this is modeled on. Pushed
+                // to cb_in0 in one batch above but still one activation tile
+                // per kt here - that's fine, CBs only guarantee FIFO order
+                // within each buffer, not lockstep timing between buffers,
+                // and the compute kernel already waits on each independently.
+                for (uint32_t lane = 0; lane < 4; lane++) {
+                    uint32_t kt = sb * 4 + lane;
+                    uint32_t a_tile_index = kt * Mt + mt;
+                    cb_reserve_back(cb_id_in1, 1);
+                    uint32_t a_addr = get_write_ptr(cb_id_in1);
+                    noc_async_read_page(a_tile_index, act_accessor, a_addr);
+                    noc_async_read_barrier();
+                    cb_push_back(cb_id_in1, 1);
+                }
             }
 
             cb_pop_front(cb_id_scratch, 1);

@@ -468,10 +468,18 @@ static void ggml_backend_ttnn_compute_mul_mat(struct ggml_tensor * dst) {
     tt::tt_metal::CoreCoord core({0, 0});
     tt::DataFormat bf16_fmt = tt::DataFormat::Float16_b;
 
+    // 4 tiles' capacity: the reader (kernels/ternary_matmul/dataflow/
+    // reader_ternary_mm.cpp, PORTING_PLAN.md sec 23) now unpacks all four
+    // K-tiles sharing a superblock from one pass over their shared packed
+    // bytes and reserves/pushes them as a single 4-tile batch, instead of
+    // one tile at a time - halves this CB's old double-buffered capacity
+    // requirement into "exactly one batch", not pipelined further since
+    // nothing else in this synchronous kernel overlaps production/consumption
+    // anyway.
     uint32_t cb_in0 = tt::CBIndex::c_0;
     tt::tt_metal::CreateCircularBuffer(
         program, core,
-        tt::tt_metal::CircularBufferConfig(2 * single_tile_size, {{cb_in0, bf16_fmt}}).set_page_size(cb_in0, single_tile_size));
+        tt::tt_metal::CircularBufferConfig(4 * single_tile_size, {{cb_in0, bf16_fmt}}).set_page_size(cb_in0, single_tile_size));
     uint32_t cb_in1 = tt::CBIndex::c_1;
     tt::tt_metal::CreateCircularBuffer(
         program, core,
