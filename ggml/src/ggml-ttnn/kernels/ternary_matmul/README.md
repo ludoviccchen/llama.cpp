@@ -6,17 +6,22 @@ them to bf16 on upload (Option A, `ggml-ttnn.cpp`'s current `graph_compute`
 path). See `PORTING_PLAN.md` sec 13/14 for the full design writeup and
 validation results.
 
-- `dataflow/reader_ternary_mm.cpp` - unpacks packed I2_S weight bytes
-  on-device into the 32x32 tile-face layout the FPU expects, and reads
-  activation tiles (dense bf16, tile-faced on the host - nothing ternary
-  about them).
-- `compute/mm.cpp` - unmodified stock FPU `matmul_tiles` accumulation
-  (identical to
-  `tt_metal/programming_examples/matmul/matmul_single_core/kernels/compute/mm.cpp`).
-  All the ternary-specific work is in the reader; since ternary weight
-  values are exactly {-1, 0, +1}, the FPU's "multiply" is bit-exact to a
-  conditional negate/pass-through/zero of the activation - already an
-  add/sub-style accumulation, just executed on the existing
+- `dataflow/reader_ternary_mm.cpp` - pure data movement: gathers each
+  superblock's packed I2_S weight bytes on-device into the 32x32 tile-face
+  layout, *undecoded* (PORTING_PLAN.md sec 24 moved the actual 2-bit decode
+  to the compute kernel's SFPU), and reads activation tiles (dense bf16,
+  tile-faced on the host - nothing ternary about them).
+- `compute/mm.cpp` - two phases per (mt, nt) (PORTING_PLAN.md sec 24):
+  Phase 1 decodes this tile's Kt ternary K-tiles from the reader's raw-byte
+  tiles using SFPU bitwise/shift/typecast ops (a vector engine - the earlier
+  from-sec-13 design did this decode on the reader's scalar RISC-V core
+  instead, which doesn't scale to real dimensions under ttsim - see sec
+  22/23); Phase 2 is the stock FPU `matmul_tiles` accumulation (identical to
+  `tt_metal/programming_examples/matmul/matmul_single_core/kernels/compute/mm.cpp`),
+  unchanged from every earlier version of this kernel. Since ternary weight
+  values are exactly {-1, 0, +1}, the FPU's "multiply" in Phase 2 is
+  bit-exact to a conditional negate/pass-through/zero of the activation -
+  already an add/sub-style accumulation, just executed on the existing
   multiply-accumulate datapath.
 - `dataflow/writer_ternary_mm.cpp` - stock tile writer, adapted for our
   `[N, M]` (not the stock example's `[M, N]`) output convention: DRAM page
@@ -48,3 +53,10 @@ Option A entirely for `GGML_OP_MUL_MAT` (see PORTING_PLAN.md sec 15) -
 directly (no re-upload). TT-NN is no longer linked by this backend at all.
 Re-verified under ttsim through the real `ggml_backend_sched`/
 `graph_compute` path, not just a hand-rolled dispatch.
+
+The SFPU-based decode (sec 24 above) measures ~6x faster than the prior
+scalar-only version at real projection-matrix dimensions (K=N=2560: ~154s
+vs ~930s under ttsim) with bit-identical output - a real architectural
+win, not just a tidy-up, though still far from practical for full
+end-to-end offload under ttsim (`ggml_backend_ttnn_mul_mat_shape_ok`'s
+`M % 32 == 0` gate stays in place - PORTING_PLAN.md sec 21/22).

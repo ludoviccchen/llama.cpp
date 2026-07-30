@@ -468,22 +468,32 @@ static void ggml_backend_ttnn_compute_mul_mat(struct ggml_tensor * dst) {
     tt::tt_metal::CoreCoord core({0, 0});
     tt::DataFormat bf16_fmt = tt::DataFormat::Float16_b;
 
-    // 4 tiles' capacity: the reader (kernels/ternary_matmul/dataflow/
-    // reader_ternary_mm.cpp, PORTING_PLAN.md sec 23) now unpacks all four
-    // K-tiles sharing a superblock from one pass over their shared packed
-    // bytes and reserves/pushes them as a single 4-tile batch, instead of
-    // one tile at a time - halves this CB's old double-buffered capacity
-    // requirement into "exactly one batch", not pipelined further since
-    // nothing else in this synchronous kernel overlaps production/consumption
-    // anyway.
+    // Sized for the full Kt-tile queue: the compute kernel's Phase 1
+    // (kernels/ternary_matmul/compute/mm.cpp, PORTING_PLAN.md sec 24)
+    // unpacks all of this (mt, nt)'s Kt weight tiles via the SFPU before
+    // Phase 2's matmul accumulation starts draining them - unlike every
+    // earlier version of this kernel, cb_in0 now needs to hold Kt tiles at
+    // once, not just 1-4. For K=2560 (Kt=80) that's ~160KB, still a small
+    // fraction of L1 alongside everything else (contrast sec 20's old
+    // whole-blob design, which needed multiple MB).
     uint32_t cb_in0 = tt::CBIndex::c_0;
     tt::tt_metal::CreateCircularBuffer(
         program, core,
-        tt::tt_metal::CircularBufferConfig(4 * single_tile_size, {{cb_in0, bf16_fmt}}).set_page_size(cb_in0, single_tile_size));
+        tt::tt_metal::CircularBufferConfig(Kt * single_tile_size, {{cb_in0, bf16_fmt}}).set_page_size(cb_in0, single_tile_size));
+    // Sized to Kt tiles, same reasoning as cb_in0 above: the reader pushes
+    // all Kt activation tiles for a given (mt, nt) before the compute
+    // kernel's Phase 2 (the only phase that drains cb_in1) even starts -
+    // Phase 1 comes first in program order and only touches cb_raw/cb_in0.
+    // A double-buffered (2-tile) cb_in1 deadlocks once Kt > 2 tiles worth of
+    // reader pushes are needed before Phase 2 begins draining: the reader
+    // blocks pushing this superblock's activation tiles into a full cb_in1,
+    // which stalls it from ever reaching the *next* superblock's cb_raw
+    // push, which Phase 1 is waiting on to proceed - a three-way circular
+    // wait (reader -> cb_in1 -> Phase 2 -> Phase 1 -> cb_raw -> reader).
     uint32_t cb_in1 = tt::CBIndex::c_1;
     tt::tt_metal::CreateCircularBuffer(
         program, core,
-        tt::tt_metal::CircularBufferConfig(2 * single_tile_size, {{cb_in1, bf16_fmt}}).set_page_size(cb_in1, single_tile_size));
+        tt::tt_metal::CircularBufferConfig(Kt * single_tile_size, {{cb_in1, bf16_fmt}}).set_page_size(cb_in1, single_tile_size));
     uint32_t cb_out = tt::CBIndex::c_16;
     tt::tt_metal::CreateCircularBuffer(
         program, core,
@@ -499,6 +509,17 @@ static void ggml_backend_ttnn_compute_mul_mat(struct ggml_tensor * dst) {
         program, core,
         tt::tt_metal::CircularBufferConfig(weight_chunk_size, {{cb_scratch, tt::DataFormat::UInt8}})
             .set_page_size(cb_scratch, weight_chunk_size));
+    // One shared raw-byte tile per superblock (PORTING_PLAN.md sec 24): the
+    // reader gathers each superblock's packed bytes into tile-face order but
+    // does not decode them; the compute kernel's SFPU reads this same tile
+    // once per lane (4 times) to extract each lane's 2-bit codes. UInt16
+    // (not UInt8) because the bitwise/shift SFPU ops this backend uses only
+    // operate on Int32/UInt32/UInt16 tiles.
+    uint32_t cb_raw = tt::CBIndex::c_3;
+    tt::tt_metal::CreateCircularBuffer(
+        program, core,
+        tt::tt_metal::CircularBufferConfig(single_tile_size, {{cb_raw, tt::DataFormat::UInt16}})
+            .set_page_size(cb_raw, single_tile_size));
 
     std::vector<uint32_t> reader_compile_args;
     tt::tt_metal::TensorAccessorArgs(*weight_buf).append_to(reader_compile_args);
