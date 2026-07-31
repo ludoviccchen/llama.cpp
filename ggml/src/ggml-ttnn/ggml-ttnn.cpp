@@ -23,6 +23,7 @@
 #include <tt-metalium/tilize_utils.hpp>
 #include <tt-metalium/work_split.hpp>
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -125,13 +126,52 @@ struct ggml_backend_ttnn_located_buffer {
     size_t offset;  // tensor's byte offset within `buffer`
 };
 
+// Creates a fresh MeshBuffer sized exactly for `tensor` (page_size == whole
+// buffer, per the sec 9 buffer-type design) and registers it in `ctx`,
+// keyed by `tensor->data`. Shared by init_tensor (the normal, first-time
+// path) and locate() (the lazy-repair path added in sec 27 - see there for
+// why a second call site needs this).
+static std::shared_ptr<ttd::MeshBuffer> ggml_backend_ttnn_alloc_tensor_buffer(
+        ggml_backend_ttnn_buffer_context * ctx, const struct ggml_tensor * tensor) {
+    auto mesh_device = ggml_backend_ttnn_get_mesh_device();
+    size_t nbytes = ggml_nbytes(tensor);
+    ttd::DeviceLocalBufferConfig device_local_config{
+        /* .page_size   = */ nbytes,
+        /* .buffer_type = */ tt::tt_metal::BufferType::DRAM,
+    };
+    auto mesh_buffer = ttd::MeshBuffer::create(ttd::ReplicatedBufferConfig{ /* .size = */ nbytes }, device_local_config, mesh_device.get());
+    ctx->tensor_buffers[tensor->data] = mesh_buffer;
+    return mesh_buffer;
+}
+
 static ggml_backend_ttnn_located_buffer ggml_backend_ttnn_locate(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor) {
     const struct ggml_tensor * root = ggml_backend_ttnn_root_tensor(tensor);
     ggml_backend_ttnn_buffer_context * ctx = (ggml_backend_ttnn_buffer_context *) buffer->context;
     auto it = ctx->tensor_buffers.find(root->data);
     GGML_ASSERT(it != ctx->tensor_buffers.end() && "ggml-ttnn: tensor has no device buffer (init_tensor not called?)");
+    std::shared_ptr<ttd::MeshBuffer> mesh_buffer = it->second;
+    // PORTING_PLAN.md sec 27: ggml's graph allocator can hand a *new*,
+    // differently-sized tensor the exact raw address a now-dead previous
+    // tensor used to occupy, without calling this backend's init_tensor
+    // callback again (observed directly: a real decode-step graph reuses
+    // a freed scratch slot for a smaller tensor than what last registered
+    // it there). Left alone, ctx->tensor_buffers would keep returning the
+    // stale, wrongly-sized buffer that belonged to whatever used to live
+    // at this address. Detected here by comparing the registered buffer's
+    // size against root's *current* size - a real, live (non-recycled)
+    // registration always matches exactly (this is exactly what the old
+    // GGML_ASSERT(ggml_nbytes(dst) == located.buffer->size()) in
+    // compute_mul_mat was checking, just at one specific call site rather
+    // than fixed at the source) - a mismatch means the address was
+    // recycled since this entry was created, so re-create it fresh, sized
+    // for root now. The old (stale) MeshBuffer object stays alive via
+    // whatever shared_ptr still references it, if anything does; this
+    // just stops routing new accesses through it.
+    if (mesh_buffer->size() != ggml_nbytes(root)) {
+        mesh_buffer = ggml_backend_ttnn_alloc_tensor_buffer(ctx, root);
+    }
     size_t offset = (const uint8_t *) tensor->data - (const uint8_t *) root->data;
-    return { it->second, offset };
+    return { mesh_buffer, offset };
 }
 
 static enum ggml_status ggml_backend_ttnn_buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) {
@@ -145,23 +185,12 @@ static enum ggml_status ggml_backend_ttnn_buffer_init_tensor(ggml_backend_buffer
         return GGML_STATUS_SUCCESS;
     }
 
-    ggml_backend_ttnn_buffer_context * ctx = (ggml_backend_ttnn_buffer_context *) buffer->context;
-    auto mesh_device = ggml_backend_ttnn_get_mesh_device();
     // I2_S tensors are stored packed (device size == host/ggml size, same as
     // every other type) - Option B's reader kernel unpacks them on-device,
     // so there is no special-cased device representation to size for here
     // any more (contrast Option A's now-removed dequant-on-upload).
-    size_t nbytes = ggml_nbytes(tensor);
-
-    // One page spanning the whole buffer: every access to it is whole-buffer
-    // (offset 0, size == nbytes), so this is always the safe end-anchored
-    // case regardless of page size.
-    ttd::DeviceLocalBufferConfig device_local_config{
-        /* .page_size   = */ nbytes,
-        /* .buffer_type = */ tt::tt_metal::BufferType::DRAM,
-    };
-    auto mesh_buffer = ttd::MeshBuffer::create(ttd::ReplicatedBufferConfig{ /* .size = */ nbytes }, device_local_config, mesh_device.get());
-    ctx->tensor_buffers[tensor->data] = mesh_buffer;
+    ggml_backend_ttnn_buffer_context * ctx = (ggml_backend_ttnn_buffer_context *) buffer->context;
+    ggml_backend_ttnn_alloc_tensor_buffer(ctx, tensor);
     return GGML_STATUS_SUCCESS;
 }
 
@@ -412,18 +441,15 @@ static void ggml_backend_ttnn_compute_mul_mat(struct ggml_tensor * dst) {
     // so a genuine sliced view is fine there and handled via the ordinary
     // get_tensor/set_tensor path (see ggml_backend_ttnn_locate).
     //
-    // PORTING_PLAN.md sec 26: with the M-alignment gate lifted, a real
-    // model graph does hit this GGML_ASSERT (dst sharing a buffer with
-    // something else via ggml's allocator reuse - previously never
-    // observed because so few MUL_MAT nodes reached this backend for it to
-    // come up). A first attempt at removing this restriction (routing the
-    // final write through the generic read-modify-write set_tensor path
-    // instead of a raw whole-buffer write) traded this loud, diagnosable
-    // assert for a *silent* heap corruption bug instead - worse, not
-    // better, and not something to ship without a clean, isolated repro
-    // and root cause (this project's own repeated principle: fail loudly,
-    // not silently - see sec 16's original reasoning for this same
-    // assert). Reverted; the assert stays until that's done properly.
+    // The ggml_nbytes(dst) == located.buffer->size() half of this assert
+    // (PORTING_PLAN.md sec 26/27) used to fail on real decode-step graphs
+    // even for a genuinely non-view dst - not because dst was a view, but
+    // because ggml's graph allocator had recycled dst's raw address from a
+    // now-dead, differently-sized previous tensor without this backend
+    // knowing, leaving a stale registry entry. ggml_backend_ttnn_locate()
+    // now self-heals that case (sec 27), so this assert's remaining job is
+    // exactly what it says: catching a genuine nonzero-offset view, which
+    // Option B's direct on-device write still cannot support.
     auto weight_located = ggml_backend_ttnn_locate(src0->buffer, src0);
     GGML_ASSERT(weight_located.offset == 0 &&
                 "ggml-ttnn: mul_mat weight (src0) must not be a nonzero-offset view");
