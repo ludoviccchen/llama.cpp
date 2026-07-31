@@ -16,13 +16,22 @@
 // consumption loop below is unchanged - but the DRAM page index must be
 // `n*Mt + m` (N-tile major) to match how the host's untilize_nfaces(N, M)
 // expects tiles laid out, not the reference's `m*Nt + n`.
+//
+// PORTING_PLAN.md sec 25: this kernel binary now runs on multiple cores,
+// each owning a disjoint slice of the tensor's N-tile range - all writing
+// into the *same* shared dst buffer (sized for the whole Mt*Nt tensor),
+// each at its own slice's page indices. `Nt` is this core's local tile
+// count; `nt_start` (its offset into the global range) must be added back
+// in for the page index, since dst's layout is keyed by the tensor-wide n,
+// not this core's locally-numbered one.
 
 #include "api/dataflow/dataflow_api.h"
 
 void kernel_main() {
     uint32_t dst_addr = get_arg_val<uint32_t>(0);
     uint32_t Mt = get_arg_val<uint32_t>(1);
-    uint32_t Nt = get_arg_val<uint32_t>(2);
+    uint32_t Nt = get_arg_val<uint32_t>(2);  // this core's N-tile count, not the whole tensor's
+    uint32_t nt_start = get_arg_val<uint32_t>(3);  // this core's offset into the tensor's global N-tile range
 
     constexpr uint32_t cb_id_out0 = 16;
 
@@ -33,7 +42,7 @@ void kernel_main() {
         for (uint32_t n = 0; n < Nt; ++n) {
             cb_wait_front(cb_id_out0, 1);
             uint32_t l1_read_addr = get_read_ptr(cb_id_out0);
-            noc_async_write_page(n * Mt + m, s, l1_read_addr);
+            noc_async_write_page((nt_start + n) * Mt + m, s, l1_read_addr);
             noc_async_write_barrier();
             cb_pop_front(cb_id_out0, 1);
         }

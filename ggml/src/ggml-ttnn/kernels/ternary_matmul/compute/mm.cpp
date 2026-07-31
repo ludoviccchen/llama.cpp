@@ -57,7 +57,11 @@ using std::uint32_t;
 void kernel_main() {
     const uint32_t Mt = get_compile_time_arg_val(0);
     const uint32_t Kt = get_compile_time_arg_val(1);
-    const uint32_t Nt = get_compile_time_arg_val(2);
+    // Runtime, not compile-time (PORTING_PLAN.md sec 25): this core's share
+    // of the N-tile range - split_work_to_cores can give different cores
+    // different counts, but one CreateKernel call compiles a single binary
+    // shared by every core, so this can't be baked in as a compile-time arg.
+    const uint32_t Nt = get_arg_val<uint32_t>(0);
     constexpr tt::CBIndex cb_in0 = tt::CBIndex::c_0;  // decoded ternary weight tiles (bf16), produced by Phase 1
     constexpr tt::CBIndex cb_in1 = tt::CBIndex::c_1;  // activation tiles (bf16), from the reader
     constexpr tt::CBIndex cb_raw = tt::CBIndex::c_3;  // one shared raw-byte tile per superblock (UInt16), from the reader

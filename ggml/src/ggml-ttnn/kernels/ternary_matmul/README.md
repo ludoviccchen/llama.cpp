@@ -29,6 +29,17 @@ validation results.
   dot product; the caller applies the per-tensor weight scale afterward
   (not baked in per-element here).
 
+All three kernels now run on multiple cores at once (PORTING_PLAN.md sec
+25): `ggml-ttnn.cpp` partitions the tensor's N-tile range across the
+device's available cores via `split_work_to_cores`, and each core runs
+this exact same triad independently on its own slice `[nt_start,
+nt_start+nt_count)` - complete output tiles, full K-depth, no cross-core
+communication. `Nt` in the reader/compute kernels is each core's *local*
+tile count, not the whole tensor's; the reader and writer additionally
+take an `nt_start` runtime arg to translate local tile indices back to
+global ones when addressing the (tensor-wide, cross-core-shared) weight
+and output DRAM buffers.
+
 ## Current scope
 
 Handles arbitrary Mt/Kt/Nt (multiple M-tiles, N-tiles, and K
@@ -57,6 +68,8 @@ Re-verified under ttsim through the real `ggml_backend_sched`/
 The SFPU-based decode (sec 24 above) measures ~6x faster than the prior
 scalar-only version at real projection-matrix dimensions (K=N=2560: ~154s
 vs ~930s under ttsim) with bit-identical output - a real architectural
-win, not just a tidy-up, though still far from practical for full
-end-to-end offload under ttsim (`ggml_backend_ttnn_mul_mat_shape_ok`'s
-`M % 32 == 0` gate stays in place - PORTING_PLAN.md sec 21/22).
+win, not just a tidy-up. Multi-core dispatch (sec 25) measures another
+~10-15x on top of that (K=N=2560: ~9.9s), ~94x faster than sec 23 combined
+- still not enough to lift `ggml_backend_ttnn_mul_mat_shape_ok`'s
+`M % 32 == 0` gate (PORTING_PLAN.md sec 21/22) by itself, but close enough
+that revisiting that decision may be worthwhile.

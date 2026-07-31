@@ -44,6 +44,16 @@
 // same "redundant but simple" tradeoff already used below for the
 // activation tiles, traded here for bounded L1 footprint.
 //
+// PORTING_PLAN.md sec 25: this same kernel binary now runs on multiple
+// cores at once, each handling a disjoint slice of the tensor's N-tile
+// range (ggml-ttnn.cpp splits Nt across the device's available cores via
+// split_work_to_cores). `Nt` here is this core's *local* tile count, not
+// the whole tensor's; `nt_start` is this core's offset into the global
+// range, needed only for DRAM addressing (the weight buffer is a single
+// tensor-wide allocation shared by every core). No other change from
+// single-core: each core independently streams its own N-tile chunks and
+// computes complete output tiles, no cross-core communication.
+//
 // PORTING_PLAN.md sec 24: this kernel used to *also* extract each element's
 // 2-bit code and decode it into a signed bf16 value here, on this
 // data-movement RISC-V core - a scalar per-element cost that, at real
@@ -64,8 +74,9 @@ void kernel_main() {
     uint32_t act_addr = get_arg_val<uint32_t>(1);
     uint32_t Mt = get_arg_val<uint32_t>(2);
     uint32_t Kt = get_arg_val<uint32_t>(3);
-    uint32_t Nt = get_arg_val<uint32_t>(4);
+    uint32_t Nt = get_arg_val<uint32_t>(4);  // this core's N-tile count, not the whole tensor's (PORTING_PLAN.md sec 25)
     uint32_t K = get_arg_val<uint32_t>(5);  // needed for the bytes-per-row stride (K/4)
+    uint32_t nt_start = get_arg_val<uint32_t>(6);  // this core's offset into the tensor's global N-tile range
 
     constexpr uint32_t cb_id_in1 = 1;       // activation tiles (bf16)
     constexpr uint32_t cb_id_scratch = 2;   // one N-tile's packed weight row-block, refreshed per (mt, nt)
@@ -111,7 +122,9 @@ void kernel_main() {
             // host transfers (see ggml-ttnn.cpp) don't apply here.
             cb_reserve_back(cb_id_scratch, 1);
             uint32_t scratch_addr = get_write_ptr(cb_id_scratch);
-            uint64_t chunk_noc_addr = weight_accessor.get_noc_addr(0, nt * weight_chunk_bytes);
+            // nt is local to this core's slice (0..Nt-1); the DRAM address
+            // needs the global N-tile index within the whole tensor.
+            uint64_t chunk_noc_addr = weight_accessor.get_noc_addr(0, (nt_start + nt) * weight_chunk_bytes);
             noc_async_read(chunk_noc_addr, scratch_addr, weight_chunk_bytes);
             noc_async_read_barrier();
             cb_push_back(cb_id_scratch, 1);

@@ -21,6 +21,7 @@
 #include <tt-metalium/host_api.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
 #include <tt-metalium/tilize_utils.hpp>
+#include <tt-metalium/work_split.hpp>
 
 #include <cstdlib>
 #include <cstring>
@@ -465,8 +466,24 @@ static void ggml_backend_ttnn_compute_mul_mat(struct ggml_tensor * dst) {
         ttd::ReplicatedBufferConfig{ /* .size = */ (size_t) single_tile_size * Nt * Mt}, tile_dram_cfg, mesh_device.get());
 
     tt::tt_metal::Program program{};
-    tt::tt_metal::CoreCoord core({0, 0});
     tt::DataFormat bf16_fmt = tt::DataFormat::Float16_b;
+
+    // Multi-core dispatch (PORTING_PLAN.md sec 25): partition the N-tile
+    // dimension across the device's available cores instead of running
+    // everything on a single core. N-tile is the natural split axis for
+    // this kernel - the per-N-tile chunked DRAM weight read (sec 20)
+    // already loops over nt, so a core just gets a contiguous sub-range of
+    // that loop instead of the whole thing, computing complete output
+    // tiles independently with no cross-core communication (each core's
+    // reader re-reads the full activation redundantly, same
+    // "redundant but simple" tradeoff already used elsewhere in this
+    // kernel - K and M are not split, every core does the full K-depth
+    // accumulation for its own N-tiles). split_work_to_cores caps the
+    // number of cores actually used at Nt when Nt is small (e.g. a single
+    // N-tile matmul still runs on exactly one core).
+    auto core_grid = mesh_device->compute_with_storage_grid_size();
+    auto [num_cores, all_cores, core_group_1, core_group_2, nt_per_core_1, nt_per_core_2] =
+        tt::tt_metal::split_work_to_cores(core_grid, Nt);
 
     // Sized for the full Kt-tile queue: the compute kernel's Phase 1
     // (kernels/ternary_matmul/compute/mm.cpp, PORTING_PLAN.md sec 24)
@@ -478,7 +495,7 @@ static void ggml_backend_ttnn_compute_mul_mat(struct ggml_tensor * dst) {
     // whole-blob design, which needed multiple MB).
     uint32_t cb_in0 = tt::CBIndex::c_0;
     tt::tt_metal::CreateCircularBuffer(
-        program, core,
+        program, all_cores,
         tt::tt_metal::CircularBufferConfig(Kt * single_tile_size, {{cb_in0, bf16_fmt}}).set_page_size(cb_in0, single_tile_size));
     // Sized to Kt tiles, same reasoning as cb_in0 above: the reader pushes
     // all Kt activation tiles for a given (mt, nt) before the compute
@@ -492,11 +509,11 @@ static void ggml_backend_ttnn_compute_mul_mat(struct ggml_tensor * dst) {
     // wait (reader -> cb_in1 -> Phase 2 -> Phase 1 -> cb_raw -> reader).
     uint32_t cb_in1 = tt::CBIndex::c_1;
     tt::tt_metal::CreateCircularBuffer(
-        program, core,
+        program, all_cores,
         tt::tt_metal::CircularBufferConfig(Kt * single_tile_size, {{cb_in1, bf16_fmt}}).set_page_size(cb_in1, single_tile_size));
     uint32_t cb_out = tt::CBIndex::c_16;
     tt::tt_metal::CreateCircularBuffer(
-        program, core,
+        program, all_cores,
         tt::tt_metal::CircularBufferConfig(2 * single_tile_size, {{cb_out, bf16_fmt}}).set_page_size(cb_out, single_tile_size));
     // Reader kernel streams one N-tile's packed weight row-block at a time
     // (see kernels/ternary_matmul/dataflow/reader_ternary_mm.cpp) rather than
@@ -506,7 +523,7 @@ static void ggml_backend_ttnn_compute_mul_mat(struct ggml_tensor * dst) {
     uint32_t cb_scratch = tt::CBIndex::c_2;
     uint32_t weight_chunk_size = TILE_DIM * (K / 4);
     tt::tt_metal::CreateCircularBuffer(
-        program, core,
+        program, all_cores,
         tt::tt_metal::CircularBufferConfig(weight_chunk_size, {{cb_scratch, tt::DataFormat::UInt8}})
             .set_page_size(cb_scratch, weight_chunk_size));
     // One shared raw-byte tile per superblock (PORTING_PLAN.md sec 24): the
@@ -517,7 +534,7 @@ static void ggml_backend_ttnn_compute_mul_mat(struct ggml_tensor * dst) {
     // operate on Int32/UInt32/UInt16 tiles.
     uint32_t cb_raw = tt::CBIndex::c_3;
     tt::tt_metal::CreateCircularBuffer(
-        program, core,
+        program, all_cores,
         tt::tt_metal::CircularBufferConfig(single_tile_size, {{cb_raw, tt::DataFormat::UInt16}})
             .set_page_size(cb_raw, single_tile_size));
 
@@ -525,7 +542,7 @@ static void ggml_backend_ttnn_compute_mul_mat(struct ggml_tensor * dst) {
     tt::tt_metal::TensorAccessorArgs(*weight_buf).append_to(reader_compile_args);
     tt::tt_metal::TensorAccessorArgs(*act_dram).append_to(reader_compile_args);
     auto reader_id = tt::tt_metal::CreateKernel(
-        program, TERNARY_MATMUL_KERNEL_DIR "dataflow/reader_ternary_mm.cpp", core,
+        program, TERNARY_MATMUL_KERNEL_DIR "dataflow/reader_ternary_mm.cpp", all_cores,
         tt::tt_metal::DataMovementConfig{
             .processor = tt::tt_metal::DataMovementProcessor::RISCV_1,
             .noc = tt::tt_metal::NOC::RISCV_1_default,
@@ -534,20 +551,43 @@ static void ggml_backend_ttnn_compute_mul_mat(struct ggml_tensor * dst) {
     std::vector<uint32_t> writer_compile_args;
     tt::tt_metal::TensorAccessorArgs(*out_dram).append_to(writer_compile_args);
     auto writer_id = tt::tt_metal::CreateKernel(
-        program, TERNARY_MATMUL_KERNEL_DIR "dataflow/writer_ternary_mm.cpp", core,
+        program, TERNARY_MATMUL_KERNEL_DIR "dataflow/writer_ternary_mm.cpp", all_cores,
         tt::tt_metal::DataMovementConfig{
             .processor = tt::tt_metal::DataMovementProcessor::RISCV_0,
             .noc = tt::tt_metal::NOC::RISCV_0_default,
             .compile_args = writer_compile_args});
 
-    std::vector<uint32_t> compute_compile_args = {Mt, Kt, Nt};
-    tt::tt_metal::CreateKernel(
-        program, TERNARY_MATMUL_KERNEL_DIR "compute/mm.cpp", core,
+    // Nt is a runtime arg (below), not a compile-time one: each core's
+    // share of the N-tile range (nt_per_core_1 vs nt_per_core_2) can differ,
+    // but a single CreateKernel call compiles one binary shared by every
+    // core in all_cores - only Mt/Kt are uniform across cores.
+    std::vector<uint32_t> compute_compile_args = {Mt, Kt};
+    auto compute_id = tt::tt_metal::CreateKernel(
+        program, TERNARY_MATMUL_KERNEL_DIR "compute/mm.cpp", all_cores,
         tt::tt_metal::ComputeConfig{.math_fidelity = tt::tt_metal::MathFidelity::HiFi4, .compile_args = compute_compile_args});
 
-    tt::tt_metal::SetRuntimeArgs(
-        program, reader_id, core, {(uint32_t) weight_buf->address(), (uint32_t) act_dram->address(), Mt, Kt, Nt, K});
-    tt::tt_metal::SetRuntimeArgs(program, writer_id, core, {(uint32_t) out_dram->address(), Mt, Nt});
+    // Assign each core a contiguous, non-overlapping slice [nt_start,
+    // nt_start + nt_count) of the global N-tile range - core_group_1 and
+    // core_group_2 partition all_cores with no overlap (core_group_2 is
+    // empty when Nt divides evenly), so iterating both unconditionally and
+    // advancing nt_start by each core's nt_count covers every N-tile
+    // exactly once.
+    uint32_t nt_start = 0;
+    for (const auto & group : {std::make_pair(core_group_1, nt_per_core_1), std::make_pair(core_group_2, nt_per_core_2)}) {
+        const auto & cores = group.first;
+        uint32_t nt_count = group.second;
+        for (const auto & range : cores.ranges()) {
+            for (const auto & c : range) {
+                tt::tt_metal::SetRuntimeArgs(
+                    program, reader_id, c,
+                    {(uint32_t) weight_buf->address(), (uint32_t) act_dram->address(), Mt, Kt, nt_count, K, nt_start});
+                tt::tt_metal::SetRuntimeArgs(
+                    program, writer_id, c, {(uint32_t) out_dram->address(), Mt, nt_count, nt_start});
+                tt::tt_metal::SetRuntimeArgs(program, compute_id, c, {nt_count});
+                nt_start += nt_count;
+            }
+        }
+    }
 
     ttd::MeshCommandQueue & cq = mesh_device->mesh_command_queue();
     ttd::MeshWorkload workload;
