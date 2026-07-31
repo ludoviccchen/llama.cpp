@@ -69,7 +69,12 @@ The SFPU-based decode (sec 24 above) measures ~6x faster than the prior
 scalar-only version at real projection-matrix dimensions (K=N=2560: ~154s
 vs ~930s under ttsim) with bit-identical output - a real architectural
 win, not just a tidy-up. Multi-core dispatch (sec 25) measures another
-~10-15x on top of that (K=N=2560: ~9.9s), ~94x faster than sec 23 combined
-- still not enough to lift `ggml_backend_ttnn_mul_mat_shape_ok`'s
-`M % 32 == 0` gate (PORTING_PLAN.md sec 21/22) by itself, but close enough
-that revisiting that decision may be worthwhile.
+~10-15x on top of that (K=N=2560: ~9.9s), ~94x faster than sec 23 combined.
+The `M % 32 == 0` gate (sec 21/22) has since been lifted (sec 26) - the
+kernel triad itself needed no changes for this (it always operated on
+whole tiles; `compute_mul_mat`'s M-padding logic, sec 22, handles the
+rest) and is verified correct at every M tested. A real end-to-end model
+run currently hits a separate, pre-existing `ggml-ttnn.cpp`-level gap this
+surfaces for the first time (`mul_mat dst must not be a view`) - not a
+kernel-triad issue, see PORTING_PLAN.md sec 26 for the full story and
+current status.

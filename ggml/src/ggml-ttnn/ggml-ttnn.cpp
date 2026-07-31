@@ -328,31 +328,23 @@ static void ggml_backend_ttnn_free(ggml_backend_t backend) {
 static bool ggml_backend_ttnn_mul_mat_shape_ok(const struct ggml_tensor * src0, const struct ggml_tensor * src1) {
     const int64_t K = src0->ne[0];
     const int64_t N = src0->ne[1];
-    const int64_t M = src1->ne[1];
     constexpr int64_t TILE_DIM = 32;
     // K a multiple of 128: one I2_S packing super-block never straddles a
-    // row (reader kernel's row-stride assumption). N/M tile-aligned: the FPU
+    // row (reader kernel's row-stride assumption). N tile-aligned: the FPU
     // only operates on whole 32x32 tiles.
     //
-    // compute_mul_mat below can in fact handle any M >= 1 (it pads up to the
-    // next tile boundary on upload and truncates the result back down before
-    // writing dst - PORTING_PLAN.md sec 22) - that padding path is real and
-    // separately verified correct. The M%32==0 gate here is deliberately
-    // kept anyway: relaxing it makes ordinary single-token decode (M=1)
-    // reach this backend for the first time (sec 21 found it never did
-    // before), which surfaces a much bigger, separate problem - the reader
-    // kernel's O(Nt*Kt*1024) scalar unpack loop takes minutes per call at
-    // real projection-matrix dimensions under ttsim (measured: a single
-    // K=2560,N=2560 call did not finish in over 580s), because the old gate
-    // had incidentally kept virtually all real per-layer decode-time matmuls
-    // away from this kernel entirely. Enabling M-padding by default would
-    // turn the existing, validated `-ngl 99` smoke test from ~20s-2min into
-    // many minutes-to-hours, for a problem the padding fix doesn't cause and
-    // can't fix (sec 22). Restoring this constraint keeps today's demo fast;
-    // lifting it again is the natural next step once the reader kernel's
-    // unpack loop is vectorized/optimized enough to be practical at real N/K
-    // scale under ttsim.
-    return src1->ne[0] == K && K % 128 == 0 && N % TILE_DIM == 0 && M % TILE_DIM == 0;
+    // M is deliberately NOT constrained here (PORTING_PLAN.md sec 26):
+    // compute_mul_mat pads it up to the next tile boundary on upload and
+    // truncates the result back down before writing dst (sec 22) - real,
+    // separately-verified-correct logic that sat dormant behind an
+    // M%32==0 gate from sec 22 through sec 25 because the reader kernel's
+    // unpack cost made ordinary single-token decode (M=1) impractical at
+    // real projection-matrix dimensions (sec 22 measured >580s per call).
+    // The SFPU redesign (sec 24) and multi-core dispatch (sec 25) brought
+    // that down by ~94x (K=2560,N=2560: ~9.9s), enough that lifting this
+    // gate no longer turns routine testing into an hours-long wait - see
+    // sec 26 for the real, measured numbers this decision is based on.
+    return src1->ne[0] == K && K % 128 == 0 && N % TILE_DIM == 0;
 }
 
 // GGML_OP_MUL_MAT, I2_S weight x F32 activation -> F32 (Option B: packed
@@ -419,6 +411,19 @@ static void ggml_backend_ttnn_compute_mul_mat(struct ggml_tensor * dst) {
     // always staged through host memory anyway (transposed + tile-faced),
     // so a genuine sliced view is fine there and handled via the ordinary
     // get_tensor/set_tensor path (see ggml_backend_ttnn_locate).
+    //
+    // PORTING_PLAN.md sec 26: with the M-alignment gate lifted, a real
+    // model graph does hit this GGML_ASSERT (dst sharing a buffer with
+    // something else via ggml's allocator reuse - previously never
+    // observed because so few MUL_MAT nodes reached this backend for it to
+    // come up). A first attempt at removing this restriction (routing the
+    // final write through the generic read-modify-write set_tensor path
+    // instead of a raw whole-buffer write) traded this loud, diagnosable
+    // assert for a *silent* heap corruption bug instead - worse, not
+    // better, and not something to ship without a clean, isolated repro
+    // and root cause (this project's own repeated principle: fail loudly,
+    // not silently - see sec 16's original reasoning for this same
+    // assert). Reverted; the assert stays until that's done properly.
     auto weight_located = ggml_backend_ttnn_locate(src0->buffer, src0);
     GGML_ASSERT(weight_located.offset == 0 &&
                 "ggml-ttnn: mul_mat weight (src0) must not be a nonzero-offset view");
