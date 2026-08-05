@@ -1362,28 +1362,40 @@ size_t quantize_i2_s(const float * src, void * dst, int64_t nrow, int64_t n_per_
     double max = 0.0;
     for (int64_t i = 0; i < n; i++) {
         double v = fabs((double)src[i]);
-        if (v > max) { max = v; break; }  // first nonzero abs as scale (BitNet convention)
+        if (v > max) { max = v; }
     }
 
     uint8_t * q = (uint8_t *)dst;
-    memset(q, 0, n / 4);
+    memset(q, 0, n / 4 + 32);
 
-    for (int64_t i = 0; i < n; i++) {
-        uint8_t val;
-        if (fabs((double)src[i]) < 1e-6) {
-            val = 1; // maps to 0
-        } else {
-            val = ((double)src[i] * max > 0) ? 2 : 0; // maps to +1 or -1
+    // mirrors dequantize_row_i2_s's layout: byte (done/4 + gp) packs the four
+    // elements {done+gp, done+32+gp, done+64+gp, done+96+gp} into bit
+    // positions {6, 4, 2, 0} respectively (strided-by-32 within each
+    // 128-element superblock, not four consecutive elements per byte).
+    for (int64_t done = 0; done < n; done += 128) {
+        for (int gp = 0; gp < 32 && done + gp < n; gp++) {
+            uint8_t byte = 0;
+            for (int k = 0; k < 4; k++) {
+                int64_t i = done + k * 32 + gp;
+                if (i >= n) {
+                    break;
+                }
+                uint8_t val;
+                if (fabs((double)src[i]) < 1e-6) {
+                    val = 1; // maps to 0
+                } else {
+                    val = ((double)src[i] * max > 0) ? 2 : 0; // maps to +1 or -1
+                }
+                byte |= val << (6 - 2 * k);
+            }
+            q[done / 4 + gp] = byte;
         }
-        int byte_idx = i / 4;
-        int bit_pos = 6 - 2 * (i % 4);
-        q[byte_idx] |= (val << bit_pos);
     }
 
     float * scale_ptr = (float *)(q + n / 4);
     scale_ptr[0] = (float)max;
 
-    return nrow * n_per_row / 4 + 32;
+    return n / 4 + 32;
 }
 
 

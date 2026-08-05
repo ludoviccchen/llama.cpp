@@ -817,6 +817,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q6_K:    return GGML_TYPE_Q6_K;
         case LLAMA_FTYPE_MOSTLY_TQ1_0:   return GGML_TYPE_TQ1_0;
         case LLAMA_FTYPE_MOSTLY_TQ2_0:   return GGML_TYPE_TQ2_0;
+        case LLAMA_FTYPE_MOSTLY_I2_S:    return GGML_TYPE_I2_S;
         case LLAMA_FTYPE_MOSTLY_IQ2_XXS: return GGML_TYPE_IQ2_XXS;
         case LLAMA_FTYPE_MOSTLY_IQ2_XS:  return GGML_TYPE_IQ2_XS;
         case LLAMA_FTYPE_MOSTLY_IQ2_S:   return GGML_TYPE_IQ2_XS;
@@ -1154,6 +1155,13 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             // the --dry-run option calculates the final quantization size without quantizing
             if (quantize) {
                 new_size = ggml_nrows(tensor) * ggml_row_size(new_type, tensor->ne[0]);
+                if (new_type == GGML_TYPE_I2_S || new_type == GGML_TYPE_TL1) {
+                    // ggml_row_size() reports the unpacked size for these types
+                    // (see ggml_nbytes()/ggml_new_tensor_impl()'s special case) -
+                    // apply the same packed-plus-scale-header adjustment here so
+                    // --dry-run reports the real output size, not a 4x-inflated one
+                    new_size = new_size / 4 + 32;
+                }
                 LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB (%s)\n",
                                tensor_size/1024.0/1024.0,
                                new_size/1024.0/1024.0,
@@ -1235,7 +1243,11 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
                 const int64_t nelements_matrix = tensor->ne[0] * tensor->ne[1];
                 const int64_t nchunk = (nelements_matrix + chunk_size - 1)/chunk_size;
-                const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
+                // I2_S packs a whole tensor into one blob with a single trailing
+                // scale (see quantize_i2_s) - it cannot be split into independent
+                // row-chunks the way per-block-scale types can, so force one chunk
+                // regardless of the requested thread count.
+                const int64_t nthread_use = (nthread > 1 && new_type != GGML_TYPE_I2_S) ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
 
                 // quantize each expert separately since they have different importance matrices
                 new_size = 0;

@@ -1297,6 +1297,18 @@ int64_t ggml_nrows(const struct ggml_tensor * tensor) {
     return tensor->ne[1]*tensor->ne[2]*tensor->ne[3];
 }
 
+// BitNet I2_S/TL1: packed weight data is 4 elements/byte plus a single
+// 32-byte trailing scale header for the *whole* tensor - there is no
+// fixed element count per header, so ggml_blck_size()/ggml_type_size()
+// cannot express this layout the way a normal block-quantized type would.
+// ggml_nbytes() and ggml_new_tensor_impl() both need this same adjustment
+// on top of the "declared 1 byte per element" unpacked size; route both
+// through here so they cannot silently drift out of sync again (they did
+// once - see PORTING_PLAN.md sec 17).
+static size_t ggml_bitnet_packed_nbytes(size_t unpacked_nbytes) {
+    return unpacked_nbytes / 4 + 32;
+}
+
 size_t ggml_nbytes(const struct ggml_tensor * tensor) {
     for (int i = 0; i < GGML_MAX_DIMS; ++i) {
         if (tensor->ne[i] <= 0) {
@@ -1313,7 +1325,7 @@ size_t ggml_nbytes(const struct ggml_tensor * tensor) {
         }
         // BitNet I2_S/TL1/TL2: special nbytes for packed weight data
         if (tensor->type == GGML_TYPE_I2_S || tensor->type == GGML_TYPE_TL1) {
-            nbytes = nbytes / 4 + 32;
+            nbytes = ggml_bitnet_packed_nbytes(nbytes);
         } else if (tensor->type == GGML_TYPE_TL2) {
             nbytes = (tensor->ne[0] - 256) * tensor->ne[1] / 3 * 5 / 8 + 256 * tensor->ne[1] / 2 * 4 / 8;
             if (nbytes % 32 != 0) nbytes = 32 - nbytes % 32 + nbytes;
@@ -1786,12 +1798,12 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         data_size *= ne[i];
     }
     // BitNet I2_S/TL1: ggml_row_size()/blck_size don't know about the packed
-    // (4 elements/byte) + trailing-scale layout - mirror ggml_nbytes()'s own
-    // special case here so this stays consistent with it (data_size is
-    // compared against ggml_nbytes(view_src) right below, and is also the
+    // (4 elements/byte) + trailing-scale layout - route through the same
+    // helper ggml_nbytes() uses so this stays consistent with it (data_size
+    // is compared against ggml_nbytes(view_src) right below, and is also the
     // real allocation size for a plain, non-view tensor of this type).
     if (type == GGML_TYPE_I2_S || type == GGML_TYPE_TL1) {
-        data_size = data_size / 4 + 32;
+        data_size = ggml_bitnet_packed_nbytes(data_size);
     }
 
     GGML_ASSERT(view_src == NULL || data_size == 0 || data_size + view_offs <= ggml_nbytes(view_src));

@@ -5528,6 +5528,15 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_tq2_0, data, nb);
             } break;
+        case GGML_TYPE_I2_S:
+            {
+                // every 2-bit code decodes to a real ternary value, so only the
+                // trailing per-tensor f32 scale (last 4 of the 32 header bytes) needs checking
+                const float * scale = (const float *)((const uint8_t *) data + nbytes - 32);
+                if (!validate_float(*scale, 0)) {
+                    return false;
+                }
+            } break;
         case GGML_TYPE_IQ1_S:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_iq1_s, data, nb);
