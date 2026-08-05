@@ -134,7 +134,16 @@ struct ggml_backend_ttnn_located_buffer {
 static std::shared_ptr<ttd::MeshBuffer> ggml_backend_ttnn_alloc_tensor_buffer(
         ggml_backend_ttnn_buffer_context * ctx, const struct ggml_tensor * tensor) {
     auto mesh_device = ggml_backend_ttnn_get_mesh_device();
-    size_t nbytes = ggml_nbytes(tensor);
+    // A tensor can legitimately have zero elements (observed: a degenerate
+    // ubatch at a chunk boundary under llama-perplexity's multi-sequence
+    // batching), making ggml_nbytes() 0. tt-metal's Buffer::view() - called
+    // on every whole-buffer read/write this backend does, sec 9 - computes
+    // `region.offset % page_size()` unconditionally, before checking
+    // anything else, crashing with SIGFPE (integer divide-by-zero) if
+    // page_size is 0. Clamp to 1 byte: a zero-element tensor is never
+    // actually read/written for real data (every transfer is sized via
+    // ggml_nbytes(), which stays 0), so the extra byte is inert.
+    size_t nbytes = std::max(ggml_nbytes(tensor), (size_t) 1);
     ttd::DeviceLocalBufferConfig device_local_config{
         /* .page_size   = */ nbytes,
         /* .buffer_type = */ tt::tt_metal::BufferType::DRAM,
@@ -167,7 +176,12 @@ static ggml_backend_ttnn_located_buffer ggml_backend_ttnn_locate(ggml_backend_bu
     // for root now. The old (stale) MeshBuffer object stays alive via
     // whatever shared_ptr still references it, if anything does; this
     // just stops routing new accesses through it.
-    if (mesh_buffer->size() != ggml_nbytes(root)) {
+    // std::max(..., 1) mirrors ggml_backend_ttnn_alloc_tensor_buffer's own
+    // zero-byte clamp - without it, a genuinely zero-element root tensor
+    // would compare its real (1-byte, clamped) buffer size against a raw
+    // ggml_nbytes() of 0, look "stale" on every single call, and reallocate
+    // a fresh buffer every time instead of reusing the registered one.
+    if (mesh_buffer->size() != std::max(ggml_nbytes(root), (size_t) 1)) {
         mesh_buffer = ggml_backend_ttnn_alloc_tensor_buffer(ctx, root);
     }
     size_t offset = (const uint8_t *) tensor->data - (const uint8_t *) root->data;
@@ -418,6 +432,19 @@ static void ggml_backend_ttnn_compute_mul_mat(struct ggml_tensor * dst) {
     const uint32_t N = (uint32_t) src0->ne[1];
     const uint32_t M = (uint32_t) src1->ne[1];
     GGML_ASSERT((uint32_t) dst->ne[0] == N && (uint32_t) dst->ne[1] == M);
+
+    // A degenerate zero-token ubatch (observed under llama-perplexity's
+    // multi-sequence batching: a chunk boundary can leave some streams with
+    // no real work on a given step) satisfies M%32==0 trivially (0%32==0),
+    // so ggml_backend_ttnn_mul_mat_shape_ok() doesn't filter it out - but
+    // there is nothing to compute or write (dst has 0 elements), and the
+    // dst-must-not-be-a-view assert below legitimately can't hold for it
+    // (ggml_nbytes(dst)==0 vs. the device buffer's own minimum size, see
+    // ggml_backend_ttnn_alloc_tensor_buffer's zero-byte clamp).
+    if (M == 0) {
+        return;
+    }
+
     const uint32_t Kt = K / TILE_DIM, Nt = N / TILE_DIM;
     // Round up to a whole number of M-tiles. supports_op() currently still
     // requires M%32==0 (ggml_backend_ttnn_mul_mat_shape_ok, PORTING_PLAN.md
@@ -662,9 +689,24 @@ static void ggml_backend_ttnn_compute_mul_mat(struct ggml_tensor * dst) {
 // (no need to link ggml-cpu just for its SIMD one) to convert into
 // whatever type the destination actually stores (F16 for a typical KV
 // cache, but not assumed - whatever supports_op() already checked).
+// `dst` (not `a`/`view_src`!) carries the shape/strides to use here: ggml's
+// own ggml_set_rows() constructs `dst` as `ggml_view_tensor(ctx, a)` where
+// `a` is its *immediate* first argument - which llama-kv-cache.cpp reshapes
+// to a flat 2D `[n_embd_gqa, kv_size*n_stream]` tensor first whenever the KV
+// cache has more than one stream (non-unified, multi-sequence), precisely so
+// SET_ROWS's row indices can address the whole multi-stream cache with a
+// single flat index space ("the idxs are global"). `dst->view_src` walks
+// past that reshape to the *original* 3D `[n_embd_gqa, kv_size, n_stream]`
+// root tensor (needed below to locate the device buffer), whose raw ne[2]
+// is the stream count, not 1 - using it here instead of `dst`'s own
+// (correctly reshaped) ne[]/nb[] made this assert fail, and would have
+// under-counted `ne1` (kv_size instead of kv_size*n_stream) too, for any
+// non-unified multi-sequence KV cache. `dst`'s ne[]/nb[] are exactly what
+// ggml-cpu's own reference (ggml_compute_forward_set_rows_f32) uses for
+// the same reason - mirror it for real this time, not just in comment.
 template <typename idx_t>
 static void ggml_backend_ttnn_set_rows_apply(
-        uint8_t * a_host, const struct ggml_tensor * a,
+        uint8_t * a_host, const struct ggml_tensor * dst,
         const uint8_t * rows_host, const struct ggml_tensor * src0,
         const uint8_t * idx_host, const struct ggml_tensor * src1,
         ggml_from_float_t from_float) {
@@ -674,8 +716,8 @@ static void ggml_backend_ttnn_set_rows_apply(
     const int64_t ne03 = src0->ne[3];
     const int64_t ne11 = src1->ne[1];
     const int64_t ne12 = src1->ne[2];
-    const int64_t ne1  = a->ne[1];
-    GGML_ASSERT(a->ne[0] == nc && a->ne[2] == ne02 && a->ne[3] == ne03);
+    const int64_t ne1  = dst->ne[1];
+    GGML_ASSERT(dst->ne[0] == nc && dst->ne[2] == ne02 && dst->ne[3] == ne03);
 
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
@@ -687,7 +729,7 @@ static void ggml_backend_ttnn_set_rows_apply(
                 GGML_ASSERT(i1 >= 0 && i1 < ne1);
 
                 const float * src_row = (const float *) (rows_host + i * src0->nb[1] + i02 * src0->nb[2] + i03 * src0->nb[3]);
-                void * dst_row = a_host + (size_t) i1 * a->nb[1] + i02 * a->nb[2] + i03 * a->nb[3];
+                void * dst_row = a_host + (size_t) i1 * dst->nb[1] + i02 * dst->nb[2] + i03 * dst->nb[3];
                 from_float(src_row, dst_row, nc);
             }
         }
@@ -723,11 +765,11 @@ static void ggml_backend_ttnn_compute_set_rows(struct ggml_tensor * dst) {
 
     if (src1->type == GGML_TYPE_I64) {
         ggml_backend_ttnn_set_rows_apply<int64_t>(
-            a_host.data(), a, rows_host.data(), src0, idx_host.data(), src1, type_traits->from_float_ref);
+            a_host.data(), dst, rows_host.data(), src0, idx_host.data(), src1, type_traits->from_float_ref);
     } else {
         GGML_ASSERT(src1->type == GGML_TYPE_I32);
         ggml_backend_ttnn_set_rows_apply<int32_t>(
-            a_host.data(), a, rows_host.data(), src0, idx_host.data(), src1, type_traits->from_float_ref);
+            a_host.data(), dst, rows_host.data(), src0, idx_host.data(), src1, type_traits->from_float_ref);
     }
 
     ggml_backend_ttnn_write_whole(a_located.buffer, a_host.data());
